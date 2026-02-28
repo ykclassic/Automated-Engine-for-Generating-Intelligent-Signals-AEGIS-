@@ -20,6 +20,7 @@ permissions:
 
 env:
   PYTHON_VERSION: '3.11'
+  ARTIFACT_NAME: market-data  # Consistent name without run ID
 
 jobs:
   # Job 1: Fetch market data
@@ -29,6 +30,7 @@ jobs:
     outputs:
       data_available: ${{ steps.check_data.outputs.data_available }}
       data_count: ${{ steps.check_data.outputs.data_count }}
+      artifact_name: ${{ steps.upload.outputs.artifact_name }}
     
     steps:
       - name: Checkout repository
@@ -76,7 +78,6 @@ jobs:
           from src.core.data_fetcher import update_all_data
           import logging
           import os
-          import json
           
           logging.basicConfig(level=logging.INFO)
           
@@ -92,7 +93,6 @@ jobs:
               print(f'Fetch error: {e}')
               # Check for cached data
               try:
-                  import pandas as pd
                   from pathlib import Path
                   parquet_files = list(Path('data/raw').glob('*.parquet'))
                   has_data = len(parquet_files) > 0
@@ -102,7 +102,7 @@ jobs:
                   print(f'Cache check failed: {e2}')
                   has_data = False
           
-          # Write to GITHUB_OUTPUT for step output
+          # Write to GITHUB_OUTPUT
           output_file = os.environ.get('GITHUB_OUTPUT')
           if output_file:
               with open(output_file, 'a') as f:
@@ -115,7 +115,6 @@ jobs:
       - name: Check data availability
         id: check_data
         run: |
-          # Get from previous step output
           echo "data_available=${{ steps.fetch_step.outputs.data_available }}" >> $GITHUB_OUTPUT
           echo "data_count=${{ steps.fetch_step.outputs.data_count }}" >> $GITHUB_OUTPUT
           
@@ -131,12 +130,17 @@ jobs:
           fi
       
       - name: Upload data artifacts
+        id: upload
         uses: actions/upload-artifact@v4
         with:
-          name: market-data-${{ github.run_id }}
+          name: ${{ env.ARTIFACT_NAME }}
           path: data/raw/*.parquet
           retention-days: 1
           overwrite: true
+      
+      - name: Set artifact name output
+        id: set_output
+        run: echo "artifact_name=${{ env.ARTIFACT_NAME }}" >> $GITHUB_OUTPUT
       
       - name: Commit data to branch
         if: always()
@@ -171,15 +175,16 @@ jobs:
   calculate-indicators:
     runs-on: ubuntu-latest
     needs: fetch-data
-    # Run if data is available OR if this is manual/scheduled trigger
-    if: ${{ needs.fetch-data.outputs.data_available == 'true' || github.event_name != 'workflow_run' }}
+    # Always try to run, will check for data in steps
+    if: ${{ needs.fetch-data.outputs.data_available == 'true' }}
     
     steps:
       - name: Debug - Check inputs
         run: |
           echo "Data available: ${{ needs.fetch-data.outputs.data_available }}"
           echo "Data count: ${{ needs.fetch-data.outputs.data_count }}"
-          echo "Event name: ${{ github.event_name }}"
+          echo "Artifact name: ${{ needs.fetch-data.outputs.artifact_name }}"
+          echo "Expected artifact: ${{ env.ARTIFACT_NAME }}"
       
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -206,21 +211,21 @@ jobs:
         run: mkdir -p data/raw data/processed data/cache logs
       
       - name: Download data from previous job
+        id: download
         uses: actions/download-artifact@v4
         with:
-          name: market-data-${{ github.run_id }}
+          name: ${{ env.ARTIFACT_NAME }}  # Use env variable, consistent name
           path: data/raw
-          continue-on-error: true
       
-      - name: Fallback to data branch
+      - name: Handle download failure
+        if: failure() && steps.download.outcome == 'failure'
         run: |
-          if [ ! "$(ls -A data/raw/*.parquet 2>/dev/null)" ]; then
-            echo "Fetching from branch..."
-            git fetch origin data-storage 2>/dev/null || true
-            git checkout origin/data-storage -- data/raw/ 2>/dev/null || true
-          fi
-          
-          # Final check
+          echo "Artifact download failed, trying data branch..."
+          git fetch origin data-storage 2>/dev/null || true
+          git checkout origin/data-storage -- data/raw/ 2>/dev/null || true
+      
+      - name: Verify data exists
+        run: |
           FILE_COUNT=$(ls data/raw/*.parquet 2>/dev/null | wc -l)
           echo "Total files: $FILE_COUNT"
           
@@ -281,7 +286,7 @@ jobs:
       - name: Upload signals
         uses: actions/upload-artifact@v4
         with:
-          name: trading-signals-${{ github.run_id }}
+          name: trading-signals
           path: |
             data/processed/latest_signals.json
             signals/signals_*.json
