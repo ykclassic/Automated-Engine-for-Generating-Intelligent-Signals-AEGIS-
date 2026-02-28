@@ -25,15 +25,15 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4  # Updated to v4
       
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5  # Updated to v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       
       - name: Cache Python dependencies
-        uses: actions/cache@v3
+        uses: actions/cache@v4  # Updated to v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
@@ -93,13 +93,14 @@ jobs:
           "
       
       - name: Upload data artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4  # Updated to v4
         with:
           name: market-data
           path: |
             data/raw/*.parquet
             data/processed/*.parquet
           retention-days: 7
+          overwrite: true  # v4 requires explicit overwrite
       
       - name: Commit data to separate branch
         run: |
