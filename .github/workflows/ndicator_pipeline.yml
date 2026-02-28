@@ -1,0 +1,161 @@
+name: AEGIS Indicator Pipeline
+
+on:
+  workflow_run:
+    workflows: ["AEGIS Data Pipeline"]
+    types:
+      - completed
+  
+  workflow_dispatch:
+  
+  schedule:
+    - cron: '*/5 * * * *'
+
+jobs:
+  calculate-indicators:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run' }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Download data artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: market-data
+          path: data/raw
+      
+      - name: Calculate indicators and confluence
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'src')
+          
+          from core.data_fetcher import DataPipeline
+          from indicators import IndicatorOrchestrator
+          from analysis.market_regime import RegimeDetector
+          from analysis.confluence import ConfluenceEngine
+          from analysis.correlation import MultiTimeframeAnalyzer
+          import pandas as pd
+          import json
+          from datetime import datetime
+          
+          # Initialize components
+          pipeline = DataPipeline()
+          orchestrator = IndicatorOrchestrator()
+          regime_detector = RegimeDetector()
+          confluence_engine = ConfluenceEngine()
+          tf_analyzer = MultiTimeframeAnalyzer()
+          
+          # Get asset list
+          import yaml
+          with open('config/assets.yaml') as f:
+              assets = yaml.safe_load(f)
+          
+          signals = []
+          
+          for tier in ['tier_1', 'tier_2']:
+              for asset in assets['assets'].get(tier, []):
+                  symbol = asset['symbol']
+                  try:
+                      print(f'Processing {symbol}...')
+                      
+                      # Fetch multi-timeframe data
+                      tf_data = {}
+                      for tf in ['1h', '4h', '1d']:
+                          df = pipeline.fetch_complete_data(symbol, tf, update_only=True)
+                          if df is not None and len(df) > 50:
+                              # Calculate indicators
+                              df = orchestrator.calculate_all(df)
+                              # Add regime features
+                              df = regime_detector.calculate_regime_features(df)
+                              tf_data[tf] = df
+                      
+                      if not tf_data:
+                          continue
+                      
+                      # Calculate confluence for primary timeframe
+                      primary_df = tf_data['1h']
+                      confluence = confluence_engine.calculate_confluence(primary_df)
+                      summary = confluence_engine.get_signal_summary(confluence)
+                      
+                      # Multi-timeframe analysis
+                      tf_signal = tf_analyzer.generate_multi_timeframe_signal(tf_data)
+                      
+                      signal_record = {
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'symbol': symbol,
+                          'price': float(primary_df['close'].iloc[-1]),
+                          'timeframe_confluence': summary,
+                          'multi_timeframe': tf_signal,
+                          'indicators': orchestrator.get_indicator_summary(primary_df)
+                      }
+                      
+                      signals.append(signal_record)
+                      print(f'{symbol}: {summary[\"direction\"]} (Score: {summary[\"score\"]}, Confidence: {summary[\"confidence\"]})')
+                      
+                  except Exception as e:
+                      print(f'Error processing {symbol}: {e}')
+                      continue
+          
+          # Save signals
+          with open('data/processed/latest_signals.json', 'w') as f:
+              json.dump(signals, f, indent=2, default=str)
+          
+          print(f'Generated {len(signals)} signals')
+          "
+      
+      - name: Upload signals
+        uses: actions/upload-artifact@v3
+        with:
+          name: trading-signals
+          path: data/processed/latest_signals.json
+      
+      - name: Send high-confidence alerts
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          python -c "
+          import json
+          import os
+          import requests
+          
+          with open('data/processed/latest_signals.json') as f:
+              signals = json.load(f)
+          
+          webhook = os.environ['DISCORD_WEBHOOK']
+          
+          for signal in signals:
+              tf = signal['timeframe_confluence']
+              
+              # Only alert on high confidence
+              if tf['confidence'] in ['High', 'Very High'] and tf['direction'] != '⚪ NEUTRAL':
+                  color = 3066993 if 'BULLISH' in tf['direction'] else 15158332
+                  emoji = '🟢' if 'BULLISH' in tf['direction'] else '🔴'
+                  
+                  embed = {
+                      'title': f'{emoji} {signal[\"symbol\"]} Signal',
+                      'color': color,
+                      'fields': [
+                          {'name': 'Direction', 'value': tf['direction'], 'inline': True},
+                          {'name': 'Score', 'value': tf['score'], 'inline': True},
+                          {'name': 'Confidence', 'value': f\"{tf['confidence']} ({tf['confidence_value']})\", 'inline': True},
+                          {'name': 'Price', 'value': f\"${signal['price']:.2f}\", 'inline': True},
+                          {'name': 'Agreement', 'value': tf['agreement'], 'inline': True},
+                          {'name': 'Key Factors', 'value': ', '.join(tf.get('key_bullish', []) + tf.get('key_bearish', [])), 'inline': False}
+                      ],
+                      'timestamp': signal['timestamp']
+                  }
+                  
+                  requests.post(webhook, json={'embeds': [embed]})
+          "
