@@ -1,0 +1,133 @@
+name: AEGIS Signal Generation
+
+on:
+  workflow_run:
+    workflows: ["AEGIS Indicator Pipeline"]
+    types:
+      - completed
+  
+  schedule:
+    - cron: '*/5 * * * *'
+  
+  workflow_dispatch:
+
+jobs:
+  generate-signals:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run' }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install lightgbm xgboost joblib
+      
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+      
+      - name: Generate signals
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'src')
+          
+          from core.data_fetcher import DataPipeline
+          from core.signal_generator import SignalGenerator
+          from notifications.formatter import SignalFormatter
+          import yaml
+          import json
+          import os
+          
+          # Initialize
+          pipeline = DataPipeline()
+          generator = SignalGenerator(risk_level='moderate', use_ml=True)
+          formatter = SignalFormatter()
+          
+          # Load assets
+          with open('config/assets.yaml') as f:
+              assets = yaml.safe_load(f)
+          
+          all_data = {}
+          for tier in ['tier_1', 'tier_2']:
+              for asset in assets['assets'].get(tier, [])[:5]:
+                  symbol = asset['symbol']
+                  try:
+                      tf_data = {}
+                      for tf in ['1h', '4h', '1d']:
+                          df = pipeline.fetch_complete_data(symbol, tf, update_only=True)
+                          if len(df) > 100:
+                              tf_data[tf] = df
+                      if tf_data:
+                          all_data[symbol] = tf_data
+                  except Exception as e:
+                      print(f'Error fetching {symbol}: {e}')
+          
+          # Generate signals
+          signals = generator.generate_all_signals(all_data, account_balance=10000)
+          
+          # Format for Discord
+          webhook = os.environ.get('DISCORD_WEBHOOK')
+          if webhook and signals:
+              import requests
+              
+              # Send summary
+              summary_embed = formatter.format_summary_embed(signals)
+              requests.post(webhook, json={'embeds': [summary_embed]})
+              
+              # Send individual signals for high confidence
+              for signal in signals:
+                  if signal.confidence in ['very_high', 'high']:
+                      embed = formatter.format_signal_embed(signal)
+                      requests.post(webhook, json={'embeds': [embed]})
+          
+          # Save signals to file
+          signals_data = []
+          for s in signals:
+              signals_data.append({
+                  'timestamp': s.timestamp.isoformat(),
+                  'symbol': s.symbol,
+                  'direction': s.direction,
+                  'confidence': s.confidence,
+                  'entry': s.entry_price,
+                  'stop': s.stop_loss,
+                  'target': s.take_profit
+              })
+          
+          with open('signals.json', 'w') as f:
+              json.dump(signals_data, f, indent=2)
+          
+          print(f'Generated {len(signals)} signals')
+          "
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      
+      - name: Upload signals
+        uses: actions/upload-artifact@v3
+        with:
+          name: trading-signals
+          path: signals.json
+      
+      - name: Update signal history
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          git fetch origin data-storage
+          git checkout data-storage
+          
+          mkdir -p signals
+          cp signals.json signals/signals_$(date +%Y%m%d_%H%M%S).json
+          
+          git add signals/
+          git commit -m "Update signals - $(date -u)" || echo "No changes"
+          git push origin data-storage
