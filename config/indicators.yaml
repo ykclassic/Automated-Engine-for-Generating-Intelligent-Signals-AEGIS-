@@ -1,0 +1,85 @@
+# Technical Indicators Configuration
+# All settings designed for causal calculation (no look-ahead bias)
+
+trend_indicators:
+  ema:
+    periods: [12, 26, 50, 200]
+    calculation: "causal"  # Uses only past data
+    
+  sma:
+    periods: [20, 50, 200]
+    calculation: "causal"
+    
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+    calculation: "causal"
+    
+  adx:
+    period: 14
+    calculation: "causal"
+    levels:
+      weak: 25
+      strong: 50
+
+momentum_indicators:
+  rsi:
+    period: 14
+    overbought: 70
+    oversold: 30
+    calculation: "causal"
+    
+  stochastic:
+    k_period: 14
+    d_period: 3
+    slowing: 3
+    calculation: "causal"
+    
+  cci:
+    period: 20
+    calculation: "causal"
+
+volatility_indicators:
+  atr:
+    period: 14
+    calculation: "causal"
+    
+  bollinger_bands:
+    period: 20
+    std_dev: 2.0
+    calculation: "causal"
+    
+  keltner_channels:
+    ema_period: 20
+    atr_period: 10
+    multiplier: 2.0
+    calculation: "causal"
+
+volume_indicators:
+  obv:
+    calculation: "causal"
+    
+  vwap:
+    period: "daily"  # Resets daily
+    calculation: "causal"
+    
+  mfi:
+    period: 14
+    calculation: "causal"
+    
+  volume_profile:
+    bins: 24
+    calculation: "causal"
+
+# Custom/Proprietary indicators
+custom_indicators:
+  market_regime:
+    adx_threshold: 25
+    volatility_percentile: 50
+    
+  trend_strength:
+    ema_alignment_periods: [12, 26, 50]
+    
+  volatility_regime:
+    atr_percentile_lookback: 100
