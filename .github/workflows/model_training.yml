@@ -1,0 +1,162 @@
+name: AEGIS Model Training
+
+on:
+  schedule:
+    # Retrain weekly on Sundays at 00:00 UTC
+    - cron: '0 0 * * 0'
+  
+  workflow_dispatch:
+    inputs:
+      optimize_hyperparams:
+        description: 'Optimize hyperparameters'
+        required: false
+        default: 'false'
+
+jobs:
+  train-models:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install lightgbm xgboost scikit-learn joblib
+      
+      - name: Download historical data
+        run: |
+          python -c "
+          from src.core.data_fetcher import DataPipeline
+          import yaml
+          
+          pipeline = DataPipeline()
+          
+          with open('config/assets.yaml') as f:
+              assets = yaml.safe_load(f)
+          
+          # Fetch extended history for training
+          for tier in ['tier_1']:
+              for asset in assets['assets'].get(tier, [])[:3]:  # Top 3 assets
+                  symbol = asset['symbol']
+                  print(f'Fetching {symbol}...')
+                  try:
+                      # Force full refresh for training
+                      pipeline.fetch_complete_data(symbol, '1h', update_only=False)
+                  except Exception as e:
+                      print(f'Error: {e}')
+          "
+      
+      - name: Train models
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'src')
+          
+          from core.data_fetcher import DataPipeline
+          from ml.train import TrainingPipeline
+          from ml.features import engineer_ml_features
+          import pandas as pd
+          import yaml
+          import json
+          
+          # Load data
+          pipeline = DataPipeline()
+          
+          with open('config/assets.yaml') as f:
+              assets = yaml.safe_load(f)
+          
+          all_data = []
+          for tier in ['tier_1']:
+              for asset in assets['assets'].get(tier, [])[:3]:
+                  symbol = asset['symbol']
+                  try:
+                      df = pipeline.fetch_complete_data(symbol, '1h', update_only=True)
+                      if len(df) > 2000:
+                          df['symbol'] = symbol
+                          all_data.append(df)
+                          print(f'Loaded {len(df)} rows for {symbol}')
+                  except Exception as e:
+                      print(f'Error loading {symbol}: {e}')
+          
+          if not all_data:
+              print('No data available for training')
+              exit(1)
+          
+          # Combine data
+          combined = pd.concat(all_data)
+          print(f'Total training samples: {len(combined)}')
+          
+          # Train models
+          trainer = TrainingPipeline()
+          results = trainer.run_full_training(combined, model_types=['lightgbm', 'xgboost', 'ensemble'])
+          
+          # Save results
+          with open('training_results.json', 'w') as f:
+              json.dump(results, f, indent=2, default=str)
+          
+          print('Training complete!')
+          for model, result in results.items():
+              if result['status'] == 'success':
+                  print(f'{model}: F1={result[\"metrics\"][\"f1_macro\"]:.4f}')
+          "
+      
+      - name: Upload models
+        uses: actions/upload-artifact@v3
+        with:
+          name: trained-models
+          path: |
+            data/models/*.joblib
+            data/models/*.json
+      
+      - name: Commit models to data branch
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          git fetch origin
+          git checkout data-storage || git checkout --orphan data-storage
+          
+          mkdir -p models
+          cp data/models/* models/ || true
+          
+          git add models/
+          git commit -m "Update trained models - $(date -u +%Y-%m-%d)" || echo "No changes"
+          git push origin data-storage || echo "Nothing to push"
+      
+      - name: Report results
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          python -c "
+          import json
+          import os
+          import requests
+          
+          with open('training_results.json') as f:
+              results = json.load(f)
+          
+          fields = []
+          for model, result in results.items():
+              if result['status'] == 'success':
+                  metrics = result['metrics']
+                  value = f\\\"F1: {metrics['f1_macro']:.3f}, Acc: {metrics['accuracy']:.3f}\\\"
+                  fields.append({'name': model, 'value': value, 'inline': True})
+              else:
+                  fields.append({'name': model, 'value': 'Failed: ' + result.get('error', 'Unknown'), 'inline': True})
+          
+          embed = {
+              'title': '🤖 Model Training Complete',
+              'color': 3447003,
+              'fields': fields,
+              'timestamp': datetime.utcnow().isoformat()
+          }
+          
+          requests.post(os.environ['DISCORD_WEBHOOK'], json={'embeds': [embed]})
+          "
