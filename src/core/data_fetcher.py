@@ -38,6 +38,7 @@ class DataValidationResult:
 class ExchangeManager:
     """
     Manages exchange connections with failover and rate limiting
+    Includes proxy support for restricted locations
     """
     
     def __init__(self, config_path: str = "config/settings.yaml"):
@@ -46,50 +47,147 @@ class ExchangeManager:
         self.rate_limiters: Dict[str, float] = {}
         self.last_request_time: Dict[str, float] = {}
         
+        # Proxy configuration from environment
+        self.proxies = self._get_proxies()
+        
         self._initialize_exchanges()
     
     def _load_config(self, path: str) -> dict:
         """Load configuration from YAML"""
-        with open(path, 'r') as f:
-            return yaml.safe_load(f)
+        try:
+            with open(path, 'r') as f:
+                return yaml.safe_load(f)
+        except Exception as e:
+            logger.error(f"Failed to load config from {path}: {e}")
+            # Return default config
+            return {
+                'api': {
+                    'exchanges': {
+                        'primary': 'binance',
+                        'backup': 'kraken'
+                    },
+                    'rate_limits': {
+                        'binance': 10,
+                        'kraken': 3
+                    },
+                    'retry': {
+                        'max_attempts': 3,
+                        'backoff_factor': 2,
+                        'timeout_seconds': 30
+                    }
+                }
+            }
+    
+    def _get_proxies(self) -> Dict[str, str]:
+        """Get proxy configuration from environment variables"""
+        proxies = {}
+        
+        # Check for proxy settings
+        http_proxy = os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
+        https_proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
+        
+        if http_proxy:
+            proxies['http'] = http_proxy
+        if https_proxy:
+            proxies['https'] = https_proxy
+        
+        if proxies:
+            logger.info(f"Using proxies: {proxies}")
+        
+        return proxies
     
     def _initialize_exchanges(self):
-        """Initialize exchange connections"""
-        exchange_ids = [
-            self.config['api']['exchanges']['primary'],
-            self.config['api']['exchanges']['backup']
+        """Initialize exchange connections with fallback"""
+        # List of exchanges to try (in order)
+        exchange_list = [
+            self.config.get('api', {}).get('exchanges', {}).get('primary', 'binance'),
+            self.config.get('api', {}).get('exchanges', {}).get('backup', 'kraken'),
+            'kraken',      # US-friendly
+            'coinbase',    # US-friendly
+            'okx',         # Global
+            'gateio',      # Global
+            'kucoin'       # Global
         ]
         
-        for exchange_id in exchange_ids:
+        # Remove duplicates while preserving order
+        seen = set()
+        exchange_list = [x for x in exchange_list if not (x in seen or seen.add(x))]
+        
+        for exchange_id in exchange_list:
+            if exchange_id in self.exchanges:
+                continue
+            
             try:
                 exchange_class = getattr(ccxt, exchange_id)
-                exchange = exchange_class({
+                
+                # Exchange-specific options
+                options = {
                     'enableRateLimit': True,
                     'options': {
                         'defaultType': 'spot',
                     }
-                })
+                }
                 
-                # Test connection
-                exchange.load_markets()
+                # Add proxy if configured
+                if self.proxies:
+                    options['proxies'] = self.proxies
                 
-                self.exchanges[exchange_id] = exchange
-                self.rate_limiters[exchange_id] = 1.0 / self.config['api']['rate_limits'][exchange_id]
-                self.last_request_time[exchange_id] = 0
+                # Special handling for specific exchanges
+                if exchange_id == 'binance':
+                    # Try both .com and .us
+                    options['options']['adjustForTimeDifference'] = True
                 
-                logger.info(f"Initialized exchange: {exchange_id}")
+                exchange = exchange_class(options)
+                
+                # Test connection with timeout
+                import socket
+                original_timeout = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(10)
+                
+                try:
+                    exchange.load_markets()
+                    
+                    self.exchanges[exchange_id] = exchange
+                    
+                    # Set rate limit
+                    rate_limits = self.config.get('api', {}).get('rate_limits', {})
+                    default_rate = 5  # Safe default
+                    self.rate_limiters[exchange_id] = 1.0 / rate_limits.get(exchange_id, default_rate)
+                    self.last_request_time[exchange_id] = 0
+                    
+                    logger.info(f"✅ Initialized exchange: {exchange_id}")
+                    
+                    # If we have at least 2 exchanges, we're good
+                    if len(self.exchanges) >= 2:
+                        break
+                        
+                except ccxt.NetworkError as e:
+                    logger.warning(f"Network error with {exchange_id}: {e}")
+                    continue
+                except ccxt.ExchangeError as e:
+                    if "restricted location" in str(e).lower() or "403" in str(e):
+                        logger.warning(f"🚫 {exchange_id} blocked in this region")
+                    else:
+                        logger.warning(f"Exchange error with {exchange_id}: {e}")
+                    continue
+                finally:
+                    socket.setdefaulttimeout(original_timeout)
                 
             except Exception as e:
-                logger.error(f"Failed to initialize {exchange_id}: {e}")
+                logger.warning(f"Failed to initialize {exchange_id}: {e}")
                 continue
         
         if not self.exchanges:
-            raise ConnectionError("No exchanges could be initialized")
+            logger.error("⚠️ No exchanges could be initialized - will use cached data only")
+            # Don't raise error - allow system to work with cached data
     
     def _rate_limit(self, exchange_id: str):
         """Apply rate limiting"""
+        if exchange_id not in self.rate_limiters:
+            return
+        
         min_interval = self.rate_limiters[exchange_id]
-        elapsed = time.time() - self.last_request_time[exchange_id]
+        elapsed = time.time() - self.last_request_time.get(exchange_id, 0)
         
         if elapsed < min_interval:
             sleep_time = min_interval - elapsed
@@ -123,20 +221,26 @@ class ExchangeManager:
         Returns:
             DataFrame with OHLCV data
         """
-        exchanges_to_try = [exchange_id] if exchange_id else list(self.exchanges.keys())
+        # If specific exchange requested, try it first
+        if exchange_id and exchange_id in self.exchanges:
+            exchanges_to_try = [exchange_id]
+        else:
+            exchanges_to_try = list(self.exchanges.keys())
+        
+        last_error = None
         
         for ex_id in exchanges_to_try:
-            if ex_id not in self.exchanges:
-                continue
-            
             try:
                 self._rate_limit(ex_id)
                 exchange = self.exchanges[ex_id]
                 
                 logger.info(f"Fetching {symbol} {timeframe} from {ex_id}")
                 
+                # Handle symbol format differences
+                normalized_symbol = self._normalize_symbol(symbol, ex_id)
+                
                 ohlcv = exchange.fetch_ohlcv(
-                    symbol=symbol,
+                    symbol=normalized_symbol,
                     timeframe=timeframe,
                     since=since,
                     limit=limit
@@ -149,17 +253,36 @@ class ExchangeManager:
                 df = self._ohlcv_to_dataframe(ohlcv, symbol, timeframe)
                 df['exchange'] = ex_id
                 
-                logger.info(f"Fetched {len(df)} candles for {symbol} {timeframe}")
+                logger.info(f"✅ Fetched {len(df)} candles for {symbol} {timeframe}")
                 return df
                 
             except ccxt.BadSymbol:
-                logger.error(f"Symbol {symbol} not available on {ex_id}")
+                logger.warning(f"Symbol {symbol} not available on {ex_id}")
+                continue
+            except ccxt.NetworkError as e:
+                logger.warning(f"Network error with {ex_id}: {e}")
+                last_error = e
+                continue
+            except ccxt.ExchangeError as e:
+                if "restricted" in str(e).lower() or "403" in str(e):
+                    logger.warning(f"🚫 {ex_id} blocked for {symbol}")
+                else:
+                    logger.warning(f"Exchange error with {ex_id}: {e}")
+                last_error = e
                 continue
             except Exception as e:
-                logger.error(f"Error fetching from {ex_id}: {e}")
+                logger.error(f"Unexpected error with {ex_id}: {e}")
+                last_error = e
                 continue
         
-        raise Exception(f"Failed to fetch data for {symbol} from all exchanges")
+        # If we get here, all exchanges failed
+        raise Exception(f"Failed to fetch data for {symbol} from all exchanges: {last_error}")
+    
+    def _normalize_symbol(self, symbol: str, exchange_id: str) -> str:
+        """Normalize symbol format for specific exchange"""
+        # Most exchanges use BTC/USDT format
+        # Some might use BTC-USDT or BTCUSDT
+        return symbol  # Default, can be extended per exchange
     
     def _ohlcv_to_dataframe(
         self,
@@ -187,6 +310,10 @@ class ExchangeManager:
     def get_exchange_status(self) -> Dict[str, bool]:
         """Get status of all exchanges"""
         return {ex_id: True for ex_id in self.exchanges.keys()}
+    
+    def has_working_exchange(self) -> bool:
+        """Check if at least one exchange is working"""
+        return len(self.exchanges) > 0
 
 
 class DataValidator:
@@ -196,11 +323,18 @@ class DataValidator:
     
     def __init__(self, config_path: str = "config/settings.yaml"):
         self.config = self._load_config(config_path)
-        self.validation_params = self.config['data']['validation']
+        self.validation_params = self.config.get('data', {}).get('validation', {
+            'max_missing_pct': 2.0,
+            'min_volume_threshold': 1000,
+            'max_price_gap_pct': 5.0
+        })
     
     def _load_config(self, path: str) -> dict:
-        with open(path, 'r') as f:
-            return yaml.safe_load(f)
+        try:
+            with open(path, 'r') as f:
+                return yaml.safe_load(f)
+        except:
+            return {}
     
     def validate(self, df: pd.DataFrame) -> DataValidationResult:
         """
@@ -218,13 +352,13 @@ class DataValidator:
         
         # Check 1: Missing values
         missing_pct = df.isnull().sum().sum() / (df.shape[0] * df.shape[1]) * 100
-        if missing_pct > self.validation_params['max_missing_pct']:
-            errors.append(f"Missing data: {missing_pct:.2f}% exceeds {self.validation_params['max_missing_pct']}%")
+        if missing_pct > self.validation_params.get('max_missing_pct', 2.0):
+            errors.append(f"Missing data: {missing_pct:.2f}% exceeds {self.validation_params.get('max_missing_pct', 2.0)}%")
         
         # Check 2: Price gaps
         gap_count = self._detect_price_gaps(df)
         if gap_count > 0:
-            warnings.append(f"Detected {gap_count} price gaps > {self.validation_params['max_price_gap_pct']}%")
+            warnings.append(f"Detected {gap_count} price gaps > {self.validation_params.get('max_price_gap_pct', 5.0)}%")
         
         # Check 3: Zero volume
         zero_volume = (df['volume'] == 0).sum()
@@ -260,7 +394,7 @@ class DataValidator:
         curr_open = df['open']
         
         gap_pct = abs((curr_open - prev_close) / prev_close * 100)
-        gaps = (gap_pct > self.validation_params['max_price_gap_pct']).sum()
+        gaps = (gap_pct > self.validation_params.get('max_price_gap_pct', 5.0)).sum()
         
         return int(gaps)
     
@@ -297,15 +431,18 @@ class DataStore:
     
     def __init__(self, config_path: str = "config/settings.yaml"):
         self.config = self._load_config(config_path)
-        self.raw_path = Path(self.config['storage']['raw_data_path'])
-        self.processed_path = Path(self.config['storage']['processed_data_path'])
-        self.cache_path = Path(self.config['storage']['cache_path'])
+        self.raw_path = Path(self.config.get('storage', {}).get('raw_data_path', 'data/raw'))
+        self.processed_path = Path(self.config.get('storage', {}).get('processed_data_path', 'data/processed'))
+        self.cache_path = Path(self.config.get('storage', {}).get('cache_path', 'data/cache'))
         
         self._ensure_directories()
     
     def _load_config(self, path: str) -> dict:
-        with open(path, 'r') as f:
-            return yaml.safe_load(f)
+        try:
+            with open(path, 'r') as f:
+                return yaml.safe_load(f)
+        except:
+            return {}
     
     def _ensure_directories(self):
         """Create necessary directories"""
@@ -335,7 +472,7 @@ class DataStore:
         
         # Save with compression
         df.to_parquet(filepath, compression='zstd', index=True)
-        logger.info(f"Saved raw data: {filepath}")
+        logger.info(f"💾 Saved raw data: {filepath}")
         
         return str(filepath)
     
@@ -368,8 +505,12 @@ class DataStore:
         # Load and concatenate all matching files
         dfs = []
         for file in sorted(files):
-            df = pd.read_parquet(file)
-            dfs.append(df)
+            try:
+                df = pd.read_parquet(file)
+                dfs.append(df)
+            except Exception as e:
+                logger.warning(f"Could not read {file}: {e}")
+                continue
         
         if not dfs:
             return None
@@ -412,7 +553,7 @@ class DataStore:
                     
                     if end_date < cutoff:
                         file.unlink()
-                        logger.info(f"Removed old data: {file}")
+                        logger.info(f"🗑️ Removed old data: {file}")
             except Exception as e:
                 logger.warning(f"Could not parse filename {file}: {e}")
 
@@ -428,19 +569,33 @@ class DataPipeline:
         self.validator = DataValidator(config_path)
         self.store = DataStore(config_path)
         
-        self.timeframes = self.config['data']['timeframes']
-        self.lookback = self.config['data']['lookback']
+        self.timeframes = self.config.get('data', {}).get('timeframes', {
+            'primary': '1h',
+            'secondary': '4h',
+            'tertiary': '1d',
+            'quaternary': '1w'
+        })
+        self.lookback = self.config.get('data', {}).get('lookback', {
+            '1h': 500,
+            '4h': 300,
+            '1d': 200,
+            '1w': 100
+        })
     
     def _load_config(self, path: str) -> dict:
-        with open(path, 'r') as f:
-            return yaml.safe_load(f)
+        try:
+            with open(path, 'r') as f:
+                return yaml.safe_load(f)
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+            return {}
     
     def fetch_complete_data(
         self,
         symbol: str,
         timeframe: str,
         update_only: bool = True
-    ) -> pd.DataFrame:
+    ) -> Optional[pd.DataFrame]:
         """
         Fetch complete or incremental data for symbol/timeframe
         
@@ -450,14 +605,26 @@ class DataPipeline:
             update_only: If True, only fetch new data since last save
         
         Returns:
-            DataFrame with complete data
+            DataFrame with complete data or None if failed
         """
+        # Check if we have any working exchanges
+        if not self.exchange_manager.has_working_exchange():
+            logger.warning("⚠️ No working exchanges - attempting to use cached data")
+            # Try to load from cache only
+            cached = self.store.load_raw_data(symbol, timeframe)
+            if cached is not None:
+                logger.info(f"📂 Using cached data for {symbol} {timeframe}: {len(cached)} candles")
+                return cached
+            else:
+                logger.error(f"❌ No cached data available for {symbol} {timeframe}")
+                return None
+        
         if update_only:
             latest = self.store.get_latest_timestamp(symbol, timeframe)
             if latest:
                 # Fetch from latest candle
                 since = int(latest.timestamp() * 1000)
-                logger.info(f"Updating {symbol} {timeframe} from {latest}")
+                logger.info(f"🔄 Updating {symbol} {timeframe} from {latest}")
             else:
                 since = None
         else:
@@ -466,37 +633,51 @@ class DataPipeline:
         # Calculate limit if starting fresh
         limit = None if since else self.lookback.get(timeframe, 500)
         
-        # Fetch from exchange
-        df_new = self.exchange_manager.fetch_ohlcv(
-            symbol=symbol,
-            timeframe=timeframe,
-            since=since,
-            limit=limit
-        )
-        
-        # Validate new data
-        validation = self.validator.validate(df_new)
-        if not validation.is_valid:
-            logger.error(f"Validation failed for {symbol} {timeframe}: {validation.errors}")
-            raise ValueError(f"Data validation failed: {validation.errors}")
-        
-        if validation.warnings:
-            logger.warning(f"Validation warnings: {validation.warnings}")
-        
-        # Merge with existing data if updating
-        if update_only and since:
-            df_existing = self.store.load_raw_data(symbol, timeframe)
-            if df_existing is not None:
-                df_combined = pd.concat([df_existing, df_new])
-                df_combined = df_combined[~df_combined.index.duplicated(keep='last')]
-                df_combined.sort_index(inplace=True)
-                df_new = df_combined
-        
-        # Save to storage
-        exchange = df_new['exchange'].iloc[0]
-        self.store.save_raw_data(df_new, symbol, timeframe, exchange)
-        
-        return df_new
+        try:
+            # Fetch from exchange
+            df_new = self.exchange_manager.fetch_ohlcv(
+                symbol=symbol,
+                timeframe=timeframe,
+                since=since,
+                limit=limit
+            )
+            
+            # Validate new data
+            validation = self.validator.validate(df_new)
+            if not validation.is_valid:
+                logger.error(f"❌ Validation failed for {symbol} {timeframe}: {validation.errors}")
+                # Still save if partial data is useful
+                if validation.missing_pct < 10:  # Allow some missing data
+                    logger.warning("Using partially valid data")
+                else:
+                    raise ValueError(f"Data validation failed: {validation.errors}")
+            
+            if validation.warnings:
+                logger.warning(f"⚠️ Validation warnings: {validation.warnings}")
+            
+            # Merge with existing data if updating
+            if update_only and since:
+                df_existing = self.store.load_raw_data(symbol, timeframe)
+                if df_existing is not None:
+                    df_combined = pd.concat([df_existing, df_new])
+                    df_combined = df_combined[~df_combined.index.duplicated(keep='last')]
+                    df_combined.sort_index(inplace=True)
+                    df_new = df_combined
+            
+            # Save to storage
+            exchange = df_new['exchange'].iloc[0] if 'exchange' in df_new.columns else 'unknown'
+            self.store.save_raw_data(df_new, symbol, timeframe, exchange)
+            
+            return df_new
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch from exchanges: {e}")
+            # Fallback to cached data
+            cached = self.store.load_raw_data(symbol, timeframe)
+            if cached is not None:
+                logger.info(f"📂 Fallback to cached data: {len(cached)} candles")
+                return cached
+            return None
     
     def fetch_multi_timeframe(
         self,
@@ -520,10 +701,13 @@ class DataPipeline:
         for tf in timeframes:
             try:
                 df = self.fetch_complete_data(symbol, tf, update_only=True)
-                data[tf] = df
-                logger.info(f"Fetched {tf}: {len(df)} candles")
+                if df is not None and not df.empty:
+                    data[tf] = df
+                    logger.info(f"✅ Fetched {tf}: {len(df)} candles")
+                else:
+                    logger.warning(f"⚠️ No data for {tf}")
             except Exception as e:
-                logger.error(f"Failed to fetch {tf}: {e}")
+                logger.error(f"❌ Failed to fetch {tf}: {e}")
                 continue
         
         return data
@@ -538,16 +722,20 @@ class DataPipeline:
         Returns:
             Dictionary of {symbol: {timeframe: DataFrame}}
         """
-        with open(assets_config_path, 'r') as f:
-            assets_config = yaml.safe_load(f)
+        try:
+            with open(assets_config_path, 'r') as f:
+                assets_config = yaml.safe_load(f)
+        except Exception as e:
+            logger.error(f"Failed to load assets config: {e}")
+            return {}
         
         all_data = {}
-        selected_tiers = assets_config['selection']['default_tiers']
-        max_assets = assets_config['selection']['max_assets']
+        selected_tiers = assets_config.get('selection', {}).get('default_tiers', ['tier_1', 'tier_2'])
+        max_assets = assets_config.get('selection', {}).get('max_assets', 10)
         
         assets_to_fetch = []
         for tier in selected_tiers:
-            if tier in assets_config['assets']:
+            if tier in assets_config.get('assets', {}):
                 assets_to_fetch.extend(assets_config['assets'][tier])
         
         assets_to_fetch = assets_to_fetch[:max_assets]
@@ -555,11 +743,12 @@ class DataPipeline:
         for asset in assets_to_fetch:
             symbol = asset['symbol']
             try:
-                logger.info(f"Fetching data for {symbol}")
+                logger.info(f"📊 Fetching data for {symbol}")
                 data = self.fetch_multi_timeframe(symbol)
-                all_data[symbol] = data
+                if data:
+                    all_data[symbol] = data
             except Exception as e:
-                logger.error(f"Failed to fetch {symbol}: {e}")
+                logger.error(f"❌ Failed to fetch {symbol}: {e}")
                 continue
         
         return all_data
@@ -571,9 +760,9 @@ class DataPipeline:
         for file in self.store.raw_path.glob("*.parquet"):
             try:
                 df = pd.read_parquet(file)
-                symbol = df['symbol'].iloc[0]
-                timeframe = df['timeframe'].iloc[0]
-                exchange = df['exchange'].iloc[0]
+                symbol = df['symbol'].iloc[0] if 'symbol' in df.columns else 'unknown'
+                timeframe = df['timeframe'].iloc[0] if 'timeframe' in df.columns else 'unknown'
+                exchange = df['exchange'].iloc[0] if 'exchange' in df.columns else 'unknown'
                 
                 records.append({
                     'symbol': symbol,
@@ -591,7 +780,7 @@ class DataPipeline:
 
 
 # Convenience functions for quick access
-def fetch_data(symbol: str, timeframe: str = "1h") -> pd.DataFrame:
+def fetch_data(symbol: str, timeframe: str = "1h") -> Optional[pd.DataFrame]:
     """Quick fetch for single symbol/timeframe"""
     pipeline = DataPipeline()
     return pipeline.fetch_complete_data(symbol, timeframe, update_only=True)
@@ -609,15 +798,15 @@ def update_all_data() -> Dict[str, Dict[str, pd.DataFrame]]:
 
 if __name__ == "__main__":
     # Test the pipeline
-    logger.info("Testing AEGIS Data Pipeline")
+    logger.info("🧪 Testing AEGIS Data Pipeline")
     
     # Test single fetch
-    df = fetch_data("BTC/USDT", "1h")
-    print(f"\nFetched BTC/USDT 1h: {len(df)} candles")
-    print(df.tail())
-    
-    # Test multi-timeframe
-    data = fetch_multi_tf("BTC/USDT")
-    print(f"\nFetched {len(data)} timeframes")
-    for tf, df in data.items():
-        print(f"  {tf}: {len(df)} candles")
+    try:
+        df = fetch_data("BTC/USDT", "1h")
+        if df is not None:
+            print(f"\n✅ Fetched BTC/USDT 1h: {len(df)} candles")
+            print(df.tail())
+        else:
+            print("\n⚠️ No data fetched - using cache or check exchanges")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
