@@ -364,7 +364,6 @@ jobs:
           "
       
             - name: Verify signals
-        run: |
           if [ -f "data/processed/latest_signals.json" ]; then
             echo "✓ Signals file created"
             python -c "import json; data=json.load(open('data/processed/latest_signals.json')); print(f'Signals: {len(data)}')"
