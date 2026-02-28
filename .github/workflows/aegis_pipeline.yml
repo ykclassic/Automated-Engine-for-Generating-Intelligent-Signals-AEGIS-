@@ -63,6 +63,7 @@ jobs:
             git checkout origin/data-storage -- data/raw/ 2>/dev/null || true
             git checkout origin/data-storage -- data/processed/ 2>/dev/null || true
           fi
+          echo "Existing data files:"
           ls -la data/raw/ 2>/dev/null || echo "No existing data"
       
       - name: Fetch market data
@@ -76,62 +77,104 @@ jobs:
           python -c "
           import sys
           sys.path.insert(0, 'src')
-          from core.data_fetcher import update_all_data
           import logging
           import os
           from pathlib import Path
+          import traceback
           
-          logging.basicConfig(level=logging.INFO)
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+          
+          # Import your data fetcher
+          try:
+              from core.data_fetcher import update_all_data
+          except ImportError as e:
+              print(f'Import error: {e}')
+              print('Available files in src:')
+              import os
+              for root, dirs, files in os.walk('src'):
+                  for f in files:
+                      print(os.path.join(root, f))
+              sys.exit(1)
           
           data_count = 0
           has_data = False
+          error_msg = None
           
           try:
+              print('Starting data fetch...')
               data = update_all_data()
-              data_count = len(data) if data else 0
+              
+              if data is None:
+                  print('WARNING: update_all_data() returned None')
+                  data = []
+              
+              data_count = len(data) if hasattr(data, '__len__') else 0
               has_data = data_count > 0
               print(f'Success: {data_count} assets updated')
+              
+              # Check if parquet files were actually created
+              raw_path = Path('data/raw')
+              parquet_files = list(raw_path.glob('*.parquet'))
+              print(f'Parquet files created: {len(parquet_files)}')
+              for f in parquet_files[:5]:  # Show first 5
+                  print(f'  - {f.name} ({f.stat().st_size} bytes)')
+                  
           except Exception as e:
+              error_msg = str(e)
               print(f'Fetch error: {e}')
-              # Check for cached data
+              traceback.print_exc()
+              
+              # Try to use cached data
               try:
-                  parquet_files = list(Path('data/raw').glob('*.parquet'))
+                  raw_path = Path('data/raw')
+                  parquet_files = list(raw_path.glob('*.parquet'))
                   has_data = len(parquet_files) > 0
                   data_count = len(parquet_files)
-                  print(f'Using cache: {data_count} files')
+                  print(f'Falling back to cache: {data_count} files')
               except Exception as e2:
                   print(f'Cache check failed: {e2}')
                   has_data = False
           
-          # Write to GITHUB_OUTPUT
+          # Write outputs
           output_file = os.environ.get('GITHUB_OUTPUT')
           if output_file:
               with open(output_file, 'a') as f:
                   f.write(f'data_available={str(has_data).lower()}\n')
                   f.write(f'data_count={data_count}\n')
+                  if error_msg:
+                      f.write(f'error_msg={error_msg[:100]}\n')
           
-          print(f'Output: data_available={has_data}, count={data_count}')
+          print(f'Final status: data_available={has_data}, count={data_count}')
           "
+      
+      - name: Debug - List data directory
+        run: |
+          echo "Contents of data/raw/:"
+          ls -lah data/raw/ 2>/dev/null || echo "Directory empty or missing"
+          echo ""
+          echo "Parquet files:"
+          find data/raw/ -name "*.parquet" -type f 2>/dev/null | head -10
       
       - name: Check data availability
         id: check_data
-        if: always()  # Always run to ensure outputs are set
+        if: always()
         run: |
-          # Count actual files
-          FILE_COUNT=$(ls data/raw/*.parquet 2>/dev/null | wc -l)
+          FILE_COUNT=$(find data/raw -name "*.parquet" -type f 2>/dev/null | wc -l)
           echo "Found $FILE_COUNT parquet files"
           
           if [ "$FILE_COUNT" -gt 0 ]; then
             echo "data_available=true" >> $GITHUB_OUTPUT
             echo "data_count=$FILE_COUNT" >> $GITHUB_OUTPUT
-            echo "Data available: true"
+            echo "status=success" >> $GITHUB_OUTPUT
           else
             echo "data_available=false" >> $GITHUB_OUTPUT
             echo "data_count=0" >> $GITHUB_OUTPUT
-            echo "Data available: false"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "WARNING: No parquet files found!"
           fi
       
       - name: Upload data artifacts
+        if: steps.check_data.outputs.data_available == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
@@ -168,11 +211,10 @@ jobs:
           
           git checkout main || true
 
-  # Job 2: Calculate indicators - Always runs when fetch-data succeeds
+  # Job 2: Calculate indicators - Runs when fetch-data succeeds
   calculate-indicators:
     runs-on: ubuntu-latest
     needs: fetch-data
-    # FIXED: Always run when fetch-data succeeds, handle data absence internally
     if: ${{ needs.fetch-data.result == 'success' }}
     
     steps:
@@ -208,31 +250,30 @@ jobs:
       
       - name: Download data from artifact
         id: download_artifact
-        continue-on-error: true  # Don't fail if artifact missing
+        if: needs.fetch-data.outputs.data_available == 'true'
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: data/raw
       
       - name: Fallback to data branch
-        if: steps.download_artifact.outcome == 'failure'
+        if: needs.fetch-data.outputs.data_available != 'true'
         run: |
-          echo "Artifact download failed, trying data branch..."
+          echo "No artifact available, trying data branch..."
           git fetch origin data-storage 2>/dev/null || true
           git checkout origin/data-storage -- data/raw/ 2>/dev/null || true
       
-      - name: Verify data and set status
+      - name: Verify data
         id: verify_data
         run: |
-          FILE_COUNT=$(ls data/raw/*.parquet 2>/dev/null | wc -l)
-          echo "Total parquet files: $FILE_COUNT"
+          FILE_COUNT=$(find data/raw -name "*.parquet" -type f 2>/dev/null | wc -l)
           echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
           
           if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "No data files available - will generate empty signals"
+            echo "No data available - will generate empty signals"
             echo "has_data=false" >> $GITHUB_OUTPUT
           else
-            echo "Data available - proceeding with signal generation"
+            echo "Data available: $FILE_COUNT files"
             echo "has_data=true" >> $GITHUB_OUTPUT
             ls -lh data/raw/*.parquet | head -5
           fi
@@ -270,7 +311,6 @@ jobs:
                   else:
                       print(f'Processing {len(all_data)} assets...')
                       
-                      # Initialize generator
                       try:
                           generator = SignalGenerator(risk_level='moderate', use_ml=False)
                       except Exception as e:
@@ -282,7 +322,6 @@ jobs:
                               signals = generator.generate_all_signals(all_data, 10000)
                               print(f'Generated {len(signals)} signals')
                               
-                              # Convert signals to JSON-serializable format
                               for s in signals:
                                   try:
                                       signal_dict = {
@@ -307,29 +346,25 @@ jobs:
                   print(f'Pipeline error: {e}')
                   traceback.print_exc()
           
-          # Ensure output directory exists
+          # Write outputs
           os.makedirs('data/processed', exist_ok=True)
           os.makedirs('signals', exist_ok=True)
           
-          # Write signals file (empty or populated)
           output_path = 'data/processed/latest_signals.json'
           with open(output_path, 'w') as f:
               json.dump(signals_data, f, indent=2, default=str)
           
-          print(f'Saved {len(signals_data)} signals to {output_path}')
-          
-          # Also save timestamped copy
           timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
           timestamp_path = f'signals/signals_{timestamp}.json'
           with open(timestamp_path, 'w') as f:
               json.dump(signals_data, f, indent=2, default=str)
           
-          # Write signal count for next steps
+          # Set output
           with open(os.environ.get('GITHUB_OUTPUT'), 'a') as f:
               f.write(f'signal_count={len(signals_data)}\n')
               f.write(f'has_data={str(has_data).lower()}\n')
           
-          print('Signal generation completed')
+          print(f'Saved {len(signals_data)} signals')
           "
         env:
           HAS_DATA: ${{ steps.verify_data.outputs.has_data }}
@@ -337,9 +372,8 @@ jobs:
       - name: Verify signals output
         run: |
           if [ -f "data/processed/latest_signals.json" ]; then
-            echo "✓ Signals file created successfully"
-            SIGNAL_COUNT=$(python -c "import json; print(len(json.load(open('data/processed/latest_signals.json'))))")
-            echo "Signal count: $SIGNAL_COUNT"
+            echo "✓ Signals file created"
+            cat data/processed/latest_signals.json | head -50
           else
             echo "ERROR: Signals file not created"
             exit 1
@@ -368,69 +402,49 @@ jobs:
           
           webhook = os.environ.get('DISCORD_WEBHOOK', '')
           if not webhook:
-              print('No Discord webhook configured')
               exit(0)
           
           try:
               with open('data/processed/latest_signals.json') as f:
                   signals = json.load(f)
-          except Exception as e:
-              print(f'Error loading signals: {e}')
+          except:
               signals = []
           
-          # Always send heartbeat
           if not signals:
               embed = {
                   'title': '💓 AEGIS Heartbeat',
-                  'description': 'No trading signals generated (no data or no opportunities)',
+                  'description': 'No signals generated',
                   'color': 9807270,
-                  'timestamp': datetime.utcnow().isoformat(),
-                  'footer': {'text': '5-min cycle completed'}
+                  'timestamp': datetime.utcnow().isoformat()
               }
-              try:
-                  requests.post(webhook, json={'embeds': [embed]})
-              except Exception as e:
-                  print(f'Discord error: {e}')
+              requests.post(webhook, json={'embeds': [embed]})
               exit(0)
           
-          # Summary for when we have signals
           longs = sum(1 for s in signals if s.get('direction') == 'long')
           shorts = sum(1 for s in signals if s.get('direction') == 'short')
-          high_conf = sum(1 for s in signals if s.get('confidence') in ['high', 'very_high'])
           
           summary = {
-              'title': f'🛡️ {len(signals)} Signals Generated',
+              'title': f'🛡️ {len(signals)} Signals',
               'color': 3447003,
               'fields': [
                   {'name': '🟢 Long', 'value': str(longs), 'inline': True},
-                  {'name': '🔴 Short', 'value': str(shorts), 'inline': True},
-                  {'name': '⭐ High Conf', 'value': str(high_conf), 'inline': True},
-                  {'name': '⏱️ Time', 'value': datetime.utcnow().strftime('%H:%M UTC'), 'inline': True}
+                  {'name': '🔴 Short', 'value': str(shorts), 'inline': True}
               ],
               'timestamp': datetime.utcnow().isoformat()
           }
+          requests.post(webhook, json={'embeds': [summary]})
           
-          try:
-              requests.post(webhook, json={'embeds': [summary]})
-          except Exception as e:
-              print(f'Discord summary error: {e}')
-          
-          # Individual high-confidence signals
           for s in signals:
               if s.get('confidence') in ['high', 'very_high']:
-                  try:
-                      color = 3066993 if s.get('direction') == 'long' else 15158332
-                      embed = {
-                          'title': f\\\"{s.get('symbol', 'Unknown')} {s.get('direction', 'neutral').upper()}\\\",\                          'color': color,
-                          'fields': [
-                              {'name': 'Confidence', 'value': f\\\"{s.get('confidence_score', 0):.1%}\\\", 'inline': True},
-                              {'name': 'Entry', 'value': f\\\"{s.get('entry_price', 0):.4f}\\\", 'inline': True},
-                              {'name': 'SL/TP', 'value': f\\\"{s.get('stop_loss', 0):.4f} / {s.get('take_profit', 0):.4f}\\\", 'inline': True}
-                          ]
-                      }
-                      requests.post(webhook, json={'embeds': [embed]})
-                  except Exception as e:
-                      print(f'Error sending signal: {e}')
+                  color = 3066993 if s.get('direction') == 'long' else 15158332
+                  embed = {
+                      'title': f\\\"{s.get('symbol')} {s.get('direction').upper()}\\\",\                      'color': color,
+                      'fields': [
+                          {'name': 'Confidence', 'value': str(s.get('confidence_score', 0)), 'inline': True},
+                          {'name': 'Entry', 'value': str(s.get('entry_price', 0)), 'inline': True}
+                      ]
+                  }
+                  requests.post(webhook, json={'embeds': [embed]})
           "
       
       - name: Commit signals
@@ -476,41 +490,33 @@ jobs:
           DATA="${{ needs.fetch-data.result }}"
           INDICATOR="${{ needs.calculate-indicators.result }}"
           DATA_AVAILABLE="${{ needs.fetch-data.outputs.data_available }}"
-          DATA_COUNT="${{ needs.fetch-data.outputs.data_count }}"
           
-          # Determine status color and title
           if [ "$DATA" == "success" ] && [ "$INDICATOR" == "success" ]; then
             if [ "$DATA_AVAILABLE" == "true" ]; then
               COLOR="3066993"
               TITLE="✅ AEGIS Success"
-              DESC="Pipeline completed with data"
             else
               COLOR="16776960"
               TITLE="⚠️ AEGIS No Data"
-              DESC="Fetch succeeded but no data available"
             fi
           elif [ "$DATA" == "success" ]; then
             COLOR="15158332"
             TITLE="❌ AEGIS Signal Gen Failed"
-            DESC="Data fetch succeeded but signal generation failed"
           else
             COLOR="15158332"
             TITLE="❌ AEGIS Data Fetch Failed"
-            DESC="Could not retrieve market data"
           fi
           
           curl -H "Content-Type: application/json" \
             -d "{
               \"embeds\": [{
                 \"title\": \"$TITLE\",
-                \"description\": \"$DESC\",
                 \"color\": $COLOR,
                 \"fields\": [
-                  {\"name\": \"Data Fetch\", \"value\": \"$DATA\", \"inline\": true},
-                  {\"name\": \"Signal Gen\", \"value\": \"$INDICATOR\", \"inline\": true},
-                  {\"name\": \"Data Available\", \"value\": \"$DATA_AVAILABLE ($DATA_COUNT files)\", \"inline\": true}
-                ],
-                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+                  {\"name\": \"Data\", \"value\": \"$DATA\", \"inline\": true},
+                  {\"name\": \"Signals\", \"value\": \"$INDICATOR\", \"inline\": true},
+                  {\"name\": \"Available\", \"value\": \"$DATA_AVAILABLE\", \"inline\": true}
+                ]
               }]
             }" \
-            $DISCORD_WEBHOOK 2>/dev/null || echo "Discord webhook failed"
+            $DISCORD_WEBHOOK 2>/dev/null || echo "Discord failed"
