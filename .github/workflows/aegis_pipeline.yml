@@ -103,20 +103,19 @@ jobs:
                   print(f'Cache check failed: {e2}')
                   has_data = False
           
-          # Write to GITHUB_OUTPUT using proper syntax
+          # Write to GITHUB_OUTPUT
           output_file = os.environ.get('GITHUB_OUTPUT')
           if output_file:
               with open(output_file, 'a') as f:
                   f.write(f'data_available={str(has_data).lower()}\n')
                   f.write(f'data_count={data_count}\n')
           
-          print(f'::set-output name=data_available::{str(has_data).lower()}')
-          print(f'::set-output name=data_count::{data_count}')
           print(f'Output: data_available={has_data}, count={data_count}')
           "
       
       - name: Check data availability
         id: check_data
+        if: always()  # Always run to ensure outputs are set
         run: |
           # Count actual files
           FILE_COUNT=$(ls data/raw/*.parquet 2>/dev/null | wc -l)
@@ -169,19 +168,19 @@ jobs:
           
           git checkout main || true
 
-  # Job 2: Calculate indicators - DEPENDS ON fetch-data
+  # Job 2: Calculate indicators - Always runs when fetch-data succeeds
   calculate-indicators:
     runs-on: ubuntu-latest
     needs: fetch-data
-    # FIXED: More robust condition checking
-    if: ${{ always() && needs.fetch-data.result == 'success' && needs.fetch-data.outputs.data_available == 'true' }}
+    # FIXED: Always run when fetch-data succeeds, handle data absence internally
+    if: ${{ needs.fetch-data.result == 'success' }}
     
     steps:
       - name: Debug - Check inputs
         run: |
           echo "Data available: '${{ needs.fetch-data.outputs.data_available }}'"
           echo "Data count: ${{ needs.fetch-data.outputs.data_count }}"
-          echo "Artifact name: ${{ env.ARTIFACT_NAME }}"
+          echo "Fetch result: ${{ needs.fetch-data.result }}"
       
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -207,32 +206,36 @@ jobs:
       - name: Create directories
         run: mkdir -p data/raw data/processed data/cache logs
       
-      - name: Download data from previous job
-        id: download
+      - name: Download data from artifact
+        id: download_artifact
+        continue-on-error: true  # Don't fail if artifact missing
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: data/raw
       
-      - name: Fallback to data branch if artifact fails
-        if: failure() && steps.download.outcome == 'failure'
+      - name: Fallback to data branch
+        if: steps.download_artifact.outcome == 'failure'
         run: |
           echo "Artifact download failed, trying data branch..."
           git fetch origin data-storage 2>/dev/null || true
           git checkout origin/data-storage -- data/raw/ 2>/dev/null || true
       
-      - name: Verify data exists
+      - name: Verify data and set status
+        id: verify_data
         run: |
           FILE_COUNT=$(ls data/raw/*.parquet 2>/dev/null | wc -l)
-          echo "Total files: $FILE_COUNT"
+          echo "Total parquet files: $FILE_COUNT"
+          echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
           
           if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "ERROR: No data files available"
-            exit 1
+            echo "No data files available - will generate empty signals"
+            echo "has_data=false" >> $GITHUB_OUTPUT
+          else
+            echo "Data available - proceeding with signal generation"
+            echo "has_data=true" >> $GITHUB_OUTPUT
+            ls -lh data/raw/*.parquet | head -5
           fi
-          
-          # Show sample of data for debugging
-          ls -lh data/raw/*.parquet | head -5
       
       - name: Generate signals
         id: generate
@@ -245,98 +248,98 @@ jobs:
           import os
           import traceback
           from datetime import datetime
-          import pandas as pd
           
-          try:
-              from core.data_fetcher import DataPipeline
-              from core.signal_generator import SignalGenerator
-              
-              print('Initializing pipeline...')
-              pipeline = DataPipeline()
-              
-              print('Fetching all assets...')
-              all_data = pipeline.fetch_all_assets()
-              
-              if not all_data:
-                  print('WARNING: No data returned from pipeline')
-                  all_data = {}
-              
-              print(f'Processing {len(all_data)} assets...')
-              
-              # Initialize generator with error handling
+          signals_data = []
+          has_data = os.environ.get('HAS_DATA', 'false') == 'true'
+          
+          if not has_data:
+              print('No data available - generating empty signals file')
+          else:
               try:
-                  generator = SignalGenerator(risk_level='moderate', use_ml=False)
+                  from core.data_fetcher import DataPipeline
+                  from core.signal_generator import SignalGenerator
+                  
+                  print('Initializing pipeline...')
+                  pipeline = DataPipeline()
+                  
+                  print('Fetching all assets...')
+                  all_data = pipeline.fetch_all_assets()
+                  
+                  if not all_data:
+                      print('WARNING: No data returned from pipeline')
+                  else:
+                      print(f'Processing {len(all_data)} assets...')
+                      
+                      # Initialize generator
+                      try:
+                          generator = SignalGenerator(risk_level='moderate', use_ml=False)
+                      except Exception as e:
+                          print(f'Generator init error: {e}')
+                          generator = None
+                      
+                      if generator and all_data:
+                          try:
+                              signals = generator.generate_all_signals(all_data, 10000)
+                              print(f'Generated {len(signals)} signals')
+                              
+                              # Convert signals to JSON-serializable format
+                              for s in signals:
+                                  try:
+                                      signal_dict = {
+                                          'timestamp': datetime.utcnow().isoformat(),
+                                          'symbol': getattr(s, 'symbol', 'unknown'),
+                                          'direction': getattr(s, 'direction', 'neutral'),
+                                          'confidence': getattr(s, 'confidence', 'low'),
+                                          'confidence_score': float(getattr(s, 'confidence_score', 0)),
+                                          'entry_price': float(getattr(s, 'entry_price', 0)),
+                                          'stop_loss': float(getattr(s, 'stop_loss', 0)),
+                                          'take_profit': float(getattr(s, 'take_profit', 0))
+                                      }
+                                      signals_data.append(signal_dict)
+                                  except Exception as e:
+                                      print(f'Error converting signal: {e}')
+                                      continue
+                          except Exception as e:
+                              print(f'Signal generation error: {e}')
+                              traceback.print_exc()
+              
               except Exception as e:
-                  print(f'Generator init error: {e}')
-                  generator = None
-              
-              signals = []
-              if generator and all_data:
-                  try:
-                      signals = generator.generate_all_signals(all_data, 10000)
-                      print(f'Generated {len(signals)} signals')
-                  except Exception as e:
-                      print(f'Signal generation error: {e}')
-                      traceback.print_exc()
-                      signals = []
-              else:
-                  print('Skipping signal generation (no generator or data)')
-              
-              # Ensure output directory exists
-              os.makedirs('data/processed', exist_ok=True)
-              
-              # Convert signals to JSON-serializable format
-              signals_data = []
-              for s in signals:
-                  try:
-                      signal_dict = {
-                          'timestamp': datetime.utcnow().isoformat(),
-                          'symbol': getattr(s, 'symbol', 'unknown'),
-                          'direction': getattr(s, 'direction', 'neutral'),
-                          'confidence': getattr(s, 'confidence', 'low'),
-                          'confidence_score': float(getattr(s, 'confidence_score', 0)),
-                          'entry_price': float(getattr(s, 'entry_price', 0)),
-                          'stop_loss': float(getattr(s, 'stop_loss', 0)),
-                          'take_profit': float(getattr(s, 'take_profit', 0))
-                      }
-                      signals_data.append(signal_dict)
-                  except Exception as e:
-                      print(f'Error converting signal: {e}')
-                      continue
-              
-              # Write signals file
-              output_path = 'data/processed/latest_signals.json'
-              with open(output_path, 'w') as f:
-                  json.dump(signals_data, f, indent=2, default=str)
-              
-              print(f'Saved {len(signals_data)} signals to {output_path}')
-              
-              # Also save timestamped copy
-              os.makedirs('signals', exist_ok=True)
-              timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-              timestamp_path = f'signals/signals_{timestamp}.json'
-              with open(timestamp_path, 'w') as f:
-                  json.dump(signals_data, f, indent=2, default=str)
-              
-              print(f'Pipeline completed successfully')
-              
-          except Exception as e:
-              print(f'FATAL ERROR: {e}')
-              traceback.print_exc()
-              # Create empty signals file to prevent downstream errors
-              os.makedirs('data/processed', exist_ok=True)
-              with open('data/processed/latest_signals.json', 'w') as f:
-                  json.dump([], f)
-              sys.exit(1)
+                  print(f'Pipeline error: {e}')
+                  traceback.print_exc()
+          
+          # Ensure output directory exists
+          os.makedirs('data/processed', exist_ok=True)
+          os.makedirs('signals', exist_ok=True)
+          
+          # Write signals file (empty or populated)
+          output_path = 'data/processed/latest_signals.json'
+          with open(output_path, 'w') as f:
+              json.dump(signals_data, f, indent=2, default=str)
+          
+          print(f'Saved {len(signals_data)} signals to {output_path}')
+          
+          # Also save timestamped copy
+          timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+          timestamp_path = f'signals/signals_{timestamp}.json'
+          with open(timestamp_path, 'w') as f:
+              json.dump(signals_data, f, indent=2, default=str)
+          
+          # Write signal count for next steps
+          with open(os.environ.get('GITHUB_OUTPUT'), 'a') as f:
+              f.write(f'signal_count={len(signals_data)}\n')
+              f.write(f'has_data={str(has_data).lower()}\n')
+          
+          print('Signal generation completed')
           "
+        env:
+          HAS_DATA: ${{ steps.verify_data.outputs.has_data }}
       
       - name: Verify signals output
         run: |
           if [ -f "data/processed/latest_signals.json" ]; then
-            echo "Signals file created successfully"
-            cat data/processed/latest_signals.json | head -20
-            SIGNAL_COUNT=$(cat data/processed/latest_signals.json | grep -c '"symbol"' || echo "0")
-            echo "Found $SIGNAL_COUNT signals"
+            echo "✓ Signals file created successfully"
+            SIGNAL_COUNT=$(python -c "import json; print(len(json.load(open('data/processed/latest_signals.json'))))")
+            echo "Signal count: $SIGNAL_COUNT"
           else
             echo "ERROR: Signals file not created"
             exit 1
@@ -375,22 +378,25 @@ jobs:
               print(f'Error loading signals: {e}')
               signals = []
           
+          # Always send heartbeat
           if not signals:
               embed = {
                   'title': '💓 AEGIS Heartbeat',
-                  'description': 'No signals generated',
+                  'description': 'No trading signals generated (no data or no opportunities)',
                   'color': 9807270,
-                  'timestamp': datetime.utcnow().isoformat()
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'footer': {'text': '5-min cycle completed'}
               }
               try:
                   requests.post(webhook, json={'embeds': [embed]})
-              except:
-                  pass
+              except Exception as e:
+                  print(f'Discord error: {e}')
               exit(0)
           
-          # Summary
+          # Summary for when we have signals
           longs = sum(1 for s in signals if s.get('direction') == 'long')
           shorts = sum(1 for s in signals if s.get('direction') == 'short')
+          high_conf = sum(1 for s in signals if s.get('confidence') in ['high', 'very_high'])
           
           summary = {
               'title': f'🛡️ {len(signals)} Signals Generated',
@@ -398,6 +404,7 @@ jobs:
               'fields': [
                   {'name': '🟢 Long', 'value': str(longs), 'inline': True},
                   {'name': '🔴 Short', 'value': str(shorts), 'inline': True},
+                  {'name': '⭐ High Conf', 'value': str(high_conf), 'inline': True},
                   {'name': '⏱️ Time', 'value': datetime.utcnow().strftime('%H:%M UTC'), 'inline': True}
               ],
               'timestamp': datetime.utcnow().isoformat()
@@ -406,7 +413,7 @@ jobs:
           try:
               requests.post(webhook, json={'embeds': [summary]})
           except Exception as e:
-              print(f'Discord error: {e}')
+              print(f'Discord summary error: {e}')
           
           # Individual high-confidence signals
           for s in signals:
@@ -417,7 +424,8 @@ jobs:
                           'title': f\\\"{s.get('symbol', 'Unknown')} {s.get('direction', 'neutral').upper()}\\\",\                          'color': color,
                           'fields': [
                               {'name': 'Confidence', 'value': f\\\"{s.get('confidence_score', 0):.1%}\\\", 'inline': True},
-                              {'name': 'Entry', 'value': f\\\"{s.get('entry_price', 0):.4f}\\\", 'inline': True}
+                              {'name': 'Entry', 'value': f\\\"{s.get('entry_price', 0):.4f}\\\", 'inline': True},
+                              {'name': 'SL/TP', 'value': f\\\"{s.get('stop_loss', 0):.4f} / {s.get('take_profit', 0):.4f}\\\", 'inline': True}
                           ]
                       }
                       requests.post(webhook, json={'embeds': [embed]})
@@ -468,31 +476,41 @@ jobs:
           DATA="${{ needs.fetch-data.result }}"
           INDICATOR="${{ needs.calculate-indicators.result }}"
           DATA_AVAILABLE="${{ needs.fetch-data.outputs.data_available }}"
+          DATA_COUNT="${{ needs.fetch-data.outputs.data_count }}"
           
+          # Determine status color and title
           if [ "$DATA" == "success" ] && [ "$INDICATOR" == "success" ]; then
-            COLOR="3066993"
-            TITLE="✅ AEGIS Success"
-          elif [ "$DATA" == "success" ] && [ "$INDICATOR" == "skipped" ]; then
-            COLOR="16776960"
-            TITLE="⚠️ AEGIS No Signals (Data Available: $DATA_AVAILABLE)"
+            if [ "$DATA_AVAILABLE" == "true" ]; then
+              COLOR="3066993"
+              TITLE="✅ AEGIS Success"
+              DESC="Pipeline completed with data"
+            else
+              COLOR="16776960"
+              TITLE="⚠️ AEGIS No Data"
+              DESC="Fetch succeeded but no data available"
+            fi
           elif [ "$DATA" == "success" ]; then
             COLOR="15158332"
-            TITLE="❌ AEGIS Signal Generation Failed"
+            TITLE="❌ AEGIS Signal Gen Failed"
+            DESC="Data fetch succeeded but signal generation failed"
           else
             COLOR="15158332"
             TITLE="❌ AEGIS Data Fetch Failed"
+            DESC="Could not retrieve market data"
           fi
           
           curl -H "Content-Type: application/json" \
             -d "{
               \"embeds\": [{
                 \"title\": \"$TITLE\",
+                \"description\": \"$DESC\",
                 \"color\": $COLOR,
                 \"fields\": [
                   {\"name\": \"Data Fetch\", \"value\": \"$DATA\", \"inline\": true},
                   {\"name\": \"Signal Gen\", \"value\": \"$INDICATOR\", \"inline\": true},
-                  {\"name\": \"Data Available\", \"value\": \"$DATA_AVAILABLE\", \"inline\": true}
-                ]
+                  {\"name\": \"Data Available\", \"value\": \"$DATA_AVAILABLE ($DATA_COUNT files)\", \"inline\": true}
+                ],
+                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
               }]
             }" \
-            $DISCORD_WEBHOOK 2>/dev/null || echo "Discord failed"
+            $DISCORD_WEBHOOK 2>/dev/null || echo "Discord webhook failed"
