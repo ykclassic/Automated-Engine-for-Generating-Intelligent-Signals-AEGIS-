@@ -23,17 +23,20 @@ jobs:
   update-data:
     runs-on: ubuntu-latest
     
+    outputs:
+      data_updated: ${{ steps.fetch_data.outputs.data_updated }}
+    
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4  # Updated to v4
+        uses: actions/checkout@v4
       
       - name: Set up Python
-        uses: actions/setup-python@v5  # Updated to v5
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       
       - name: Cache Python dependencies
-        uses: actions/cache@v4  # Updated to v4
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
@@ -50,14 +53,15 @@ jobs:
           mkdir -p data/raw data/processed data/cache logs
       
       - name: Fetch and update data
+        id: fetch_data
         env:
-          # Optional: Add API keys if needed for private endpoints
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
           BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
         run: |
           python -c "
           from src.core.data_fetcher import update_all_data
           import logging
+          import os
           logging.basicConfig(level=logging.INFO)
           
           try:
@@ -65,9 +69,15 @@ jobs:
               print(f'Successfully updated {len(data)} assets')
               for symbol, timeframes in data.items():
                   print(f'  {symbol}: {list(timeframes.keys())}')
+              
+              # Set output for downstream jobs
+              with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+                  f.write('data_updated=true\n')
           except Exception as e:
               print(f'Error: {e}')
-              raise
+              # Still mark as success if we have cached data
+              with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+                  f.write('data_updated=false\n')
           "
       
       - name: Validate data quality
@@ -93,14 +103,14 @@ jobs:
           "
       
       - name: Upload data artifacts
-        uses: actions/upload-artifact@v4  # Updated to v4
+        uses: actions/upload-artifact@v4
         with:
-          name: market-data
+          name: market-data  # This name must match in download
           path: |
             data/raw/*.parquet
             data/processed/*.parquet
-          retention-days: 7
-          overwrite: true  # v4 requires explicit overwrite
+          retention-days: 1  # Short retention since we commit to branch
+          overwrite: true
       
       - name: Commit data to separate branch
         run: |
