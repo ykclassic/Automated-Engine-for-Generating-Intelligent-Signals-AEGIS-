@@ -1,0 +1,70 @@
+# AEGIS Trading Bot Configuration
+# Institutional-grade settings for swing trading signal generation
+
+app:
+  name: "AEGIS"
+  version: "1.0.0"
+  environment: "production"  # production, development, testing
+  timezone: "UTC"
+  
+# Data Configuration
+data:
+  # Timeframes to fetch (1h primary for swing trading)
+  timeframes:
+    primary: "1h"      # Main trading timeframe
+    higher: ["4h", "1d", "1w"]  # Confirmation timeframes
+    lower: ["15m"]     # Entry timing (optional)
+  
+  # Lookback periods for feature calculation
+  lookback:
+    "15m": 500
+    "1h": 1000
+    "4h": 500
+    "1d": 365
+    "1w": 52
+  
+  # Data quality thresholds
+  quality:
+    max_missing_pct: 1.0        # Max 1% missing data allowed
+    max_gap_minutes: 60         # Max gap before interpolation
+    outlier_std_threshold: 4.0  # Z-score for outlier detection
+  
+  # Storage
+  storage:
+    format: "parquet"
+    compression: "zstd"
+    partition_by: ["year", "month"]
+
+# Exchange Configuration
+exchanges:
+  primary: "binance"
+  fallbacks: ["bybit", "okx"]
+  
+  binance:
+    rate_limit: 1200  # requests per minute
+    retry_attempts: 3
+    timeout: 30
+  
+  bybit:
+    rate_limit: 600
+    retry_attempts: 3
+    timeout: 30
+
+# Logging
+logging:
+  level: "INFO"
+  format: "json"
+  retention_days: 30
+  
+# Feature Engineering
+features:
+  # Causal window settings (prevent look-ahead bias)
+  causal_windows:
+    sma: [20, 50, 200]
+    ema: [12, 26, 50]
+    rsi: 14
+    atr: 14
+    bbands: 20
+  
+  # Minimum data points required for feature calculation
+  min_data_points: 250
