@@ -18,116 +18,173 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4  # Updated to v4
       
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5  # Updated to v5
         with:
           python-version: '3.11'
       
+      - name: Cache Python dependencies
+        uses: actions/cache@v4  # Updated to v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install lightgbm xgboost joblib
       
-      - name: Download artifacts
-        uses: actions/download-artifact@v3
+      - name: Download processed signals
+        uses: actions/download-artifact@v4  # Updated to v4
         with:
-          path: artifacts
+          name: processed-signals
+          path: data/processed
+          github-token: ${{ secrets.GITHUB_TOKEN }}  # v4 requires token
       
-      - name: Generate signals
+      - name: Generate and send signals
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           python -c "
           import sys
+          import os
+          import json
+          import requests
+          from datetime import datetime
+          
           sys.path.insert(0, 'src')
           
-          from core.data_fetcher import DataPipeline
-          from core.signal_generator import SignalGenerator
           from notifications.formatter import SignalFormatter
-          import yaml
-          import json
-          import os
           
-          # Initialize
-          pipeline = DataPipeline()
-          generator = SignalGenerator(risk_level='moderate', use_ml=True)
           formatter = SignalFormatter()
-          
-          # Load assets
-          with open('config/assets.yaml') as f:
-              assets = yaml.safe_load(f)
-          
-          all_data = {}
-          for tier in ['tier_1', 'tier_2']:
-              for asset in assets['assets'].get(tier, [])[:5]:
-                  symbol = asset['symbol']
-                  try:
-                      tf_data = {}
-                      for tf in ['1h', '4h', '1d']:
-                          df = pipeline.fetch_complete_data(symbol, tf, update_only=True)
-                          if len(df) > 100:
-                              tf_data[tf] = df
-                      if tf_data:
-                          all_data[symbol] = tf_data
-                  except Exception as e:
-                      print(f'Error fetching {symbol}: {e}')
-          
-          # Generate signals
-          signals = generator.generate_all_signals(all_data, account_balance=10000)
-          
-          # Format for Discord
           webhook = os.environ.get('DISCORD_WEBHOOK')
-          if webhook and signals:
-              import requests
+          
+          # Load signals
+          try:
+              with open('data/processed/latest_signals.json') as f:
+                  signals = json.load(f)
+          except Exception as e:
+              print(f'Error loading signals: {e}')
+              signals = []
+          
+          if not signals:
+              print('No signals to send')
+              # Send heartbeat to Discord
+              if webhook:
+                  embed = {
+                      'title': '💓 AEGIS Heartbeat',
+                      'description': 'No high-quality signals found in current scan.',
+                      'color': 9807270,
+                      'timestamp': datetime.utcnow().isoformat()
+                  }
+                  requests.post(webhook, json={'embeds': [embed]})
+              exit(0)
+          
+          # Send summary
+          if webhook:
+              print(f'Sending {len(signals)} signals to Discord...')
               
-              # Send summary
-              summary_embed = formatter.format_summary_embed(signals)
+              # Send summary embed
+              summary_embed = {
+                  'title': '🛡️ AEGIS Signal Summary',
+                  'description': f'Found {len(signals)} tradeable opportunities.',
+                  'color': 3447003,
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'fields': []
+              }
+              
+              # Count by direction
+              longs = sum(1 for s in signals if s.get('timeframe_confluence', {}).get('direction', '').startswith('🟢'))
+              shorts = sum(1 for s in signals if s.get('timeframe_confluence', {}).get('direction', '').startswith('🔴'))
+              
+              summary_embed['fields'] = [
+                  {'name': '🟢 Long Signals', 'value': str(longs), 'inline': True},
+                  {'name': '🔴 Short Signals', 'value': str(shorts), 'inline': True},
+                  {'name': '📊 Total', 'value': str(len(signals)), 'inline': True}
+              ]
+              
               requests.post(webhook, json={'embeds': [summary_embed]})
               
-              # Send individual signals for high confidence
+              # Send individual high-confidence signals
               for signal in signals:
-                  if signal.confidence in ['very_high', 'high']:
-                      embed = formatter.format_signal_embed(signal)
+                  conf = signal.get('timeframe_confluence', {}).get('confidence', 'low')
+                  if conf in ['Very High', 'High']:
+                      # Format individual signal
+                      color = 3066993 if 'BULLISH' in signal.get('timeframe_confluence', {}).get('direction', '') else 15158332
+                      
+                      embed = {
+                          'title': f\\\"{signal['symbol']} Signal\\\",\                          'color': color,
+                          'timestamp': signal.get('timestamp', datetime.utcnow().isoformat()),
+                          'fields': [
+                              {'name': 'Direction', 'value': signal.get('timeframe_confluence', {}).get('direction', 'Unknown'), 'inline': True},
+                              {'name': 'Confidence', 'value': f\\\"{conf} ({signal.get('timeframe_confluence', {}).get('confidence_value', '0%')})\\\", 'inline': True},
+                              {'name': 'Price', 'value': f\\\"${signal.get('price', 0):,.2f}\\\", 'inline': True}
+                          ]
+                      }
+                      
+                      # Add R:R if available
+                      tf_signal = signal.get('multi_timeframe', {})
+                      if tf_signal.get('risk_reward'):
+                          embed['fields'].append({
+                              'name': 'R:R Ratio',
+                              'value': f\\\"{tf_signal['risk_reward']:.2f}:1\\\",
+                              'inline': True
+                          })
+                      
                       requests.post(webhook, json={'embeds': [embed]})
+                      print(f\\\"Sent signal for {signal['symbol']}\\\")
           
-          # Save signals to file
-          signals_data = []
-          for s in signals:
-              signals_data.append({
-                  'timestamp': s.timestamp.isoformat(),
-                  'symbol': s.symbol,
-                  'direction': s.direction,
-                  'confidence': s.confidence,
-                  'entry': s.entry_price,
-                  'stop': s.stop_loss,
-                  'target': s.take_profit
-              })
+          # Save signals to file for history
+          os.makedirs('signals', exist_ok=True)
+          timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+          with open(f'signals/signals_{timestamp}.json', 'w') as f:
+              json.dump(signals, f, indent=2, default=str)
           
-          with open('signals.json', 'w') as f:
-              json.dump(signals_data, f, indent=2)
-          
-          print(f'Generated {len(signals)} signals')
+          print(f'Completed signal generation: {len(signals)} signals')
           "
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
       
-      - name: Upload signals
-        uses: actions/upload-artifact@v3
+      - name: Upload signal history
+        uses: actions/upload-artifact@v4  # Updated to v4
         with:
-          name: trading-signals
-          path: signals.json
+          name: signal-history
+          path: signals/signals_*.json
+          retention-days: 30
+          overwrite: true
       
-      - name: Update signal history
+      - name: Commit signals to data branch
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           
-          git fetch origin data-storage
-          git checkout data-storage
+          git fetch origin data-storage || true
+          git checkout data-storage || git checkout --orphan data-storage
           
           mkdir -p signals
-          cp signals.json signals/signals_$(date +%Y%m%d_%H%M%S).json
+          cp signals/signals_*.json signals/ || true
           
           git add signals/
           git commit -m "Update signals - $(date -u)" || echo "No changes"
-          git push origin data-storage
+          git push origin data-storage || echo "Nothing to push"
+      
+      - name: Report failure to Discord
+        if: failure()
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          curl -H "Content-Type: application/json" \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"❌ Signal Pipeline Failed\",
+                \"color\": 15158332,
+                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+                \"fields\": [
+                  {\"name\": \"Error\", \"value\": \"Check GitHub Actions logs\", \"inline\": false}
+                ]
+              }]
+            }" \
+            $DISCORD_WEBHOOK || true
