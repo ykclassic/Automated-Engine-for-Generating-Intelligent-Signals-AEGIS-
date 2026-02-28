@@ -363,11 +363,11 @@ jobs:
           print(f'Saved {len(signals_data)} signals')
           "
       
-      - name: Verify signals
+            - name: Verify signals
         run: |
           if [ -f "data/processed/latest_signals.json" ]; then
             echo "✓ Signals file created"
-            python -c "import json; print(f'Signals: {len(json.load(open(\\\"data/processed/latest_signals.json\\\")))}')"
+            python -c "import json; data=json.load(open('data/processed/latest_signals.json')); print(f'Signals: {len(data)}')"
           else
             echo "ERROR: Signals file not created"
             exit 1
