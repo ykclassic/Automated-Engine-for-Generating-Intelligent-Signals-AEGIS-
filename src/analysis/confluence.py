@@ -534,4 +534,104 @@ class ConfluenceEngine:
                 for s in cat_signals 
                 if s.direction == SignalDirection.BULLISH
             )
-            bearish
+            bearish_score = sum(
+                s.strength * s.confidence 
+                for s in cat_signals 
+                if s.direction == SignalDirection.BEARISH
+            )
+            
+            net_score = (bullish_score - bearish_score) * weight
+            avg_confidence = np.mean([s.confidence for s in cat_signals])
+            
+            category_scores[category] = net_score
+            category_confidences[category] = avg_confidence
+        
+        # Calculate overall score
+        overall_score = sum(category_scores.values())
+        
+        # Determine direction
+        if overall_score > 0.2:
+            direction = SignalDirection.BULLISH
+        elif overall_score < -0.2:
+            direction = SignalDirection.BEARISH
+        else:
+            direction = SignalDirection.NEUTRAL
+        
+        # Calculate confidence
+        avg_confidence = np.mean(list(category_confidences.values())) if category_confidences else 0
+        
+        # Calculate agreement ratio (what % of signals agree with overall direction)
+        agreeing_signals = sum(
+            1 for s in all_signals 
+            if s.direction == direction or s.direction == SignalDirection.NEUTRAL
+        )
+        agreement_ratio = agreeing_signals / len(all_signals)
+        
+        # Adjust confidence by agreement
+        final_confidence = avg_confidence * agreement_ratio
+        
+        # Find dominant category (highest absolute contribution)
+        dominant_category = max(
+            category_scores.keys(),
+            key=lambda k: abs(category_scores[k])
+        ) if category_scores else 'none'
+        
+        return ConfluenceScore(
+            overall_direction=direction,
+            overall_score=np.clip(overall_score, -1.0, 1.0),
+            confidence=final_confidence,
+            signals=all_signals,
+            dominant_category=dominant_category,
+            agreement_ratio=agreement_ratio
+        )
+    
+    def get_signal_summary(self, score: ConfluenceScore) -> Dict:
+        """
+        Generate human-readable signal summary
+        """
+        direction_str = {
+            SignalDirection.BULLISH: "🟢 BULLISH",
+            SignalDirection.BEARISH: "🔴 BEARISH",
+            SignalDirection.NEUTRAL: "⚪ NEUTRAL"
+        }[score.overall_direction]
+        
+        # Confidence interpretation
+        if score.confidence >= 0.8:
+            confidence_str = "Very High"
+        elif score.confidence >= 0.6:
+            confidence_str = "High"
+        elif score.confidence >= 0.4:
+            confidence_str = "Moderate"
+        else:
+            confidence_str = "Low"
+        
+        # Group signals by direction
+        bullish_signals = [s for s in score.signals if s.direction == SignalDirection.BULLISH]
+        bearish_signals = [s for s in score.signals if s.direction == SignalDirection.BEARISH]
+        
+        return {
+            'direction': direction_str,
+            'score': f"{score.overall_score:+.2f}",
+            'confidence': confidence_str,
+            'confidence_value': f"{score.confidence:.1%}",
+            'agreement': f"{score.agreement_ratio:.1%}",
+            'dominant_factor': score.dominant_category,
+            'bullish_signals': len(bullish_signals),
+            'bearish_signals': len(bearish_signals),
+            'total_signals': len(score.signals),
+            'key_bullish': [s.name for s in sorted(bullish_signals, key=lambda x: x.strength, reverse=True)[:3]],
+            'key_bearish': [s.name for s in sorted(bearish_signals, key=lambda x: x.strength, reverse=True)[:3]]
+        }
+
+
+# Convenience functions
+def calculate_confluence(df: pd.DataFrame) -> ConfluenceScore:
+    """Quick confluence calculation"""
+    engine = ConfluenceEngine()
+    return engine.calculate_confluence(df)
+
+def get_signal(df: pd.DataFrame) -> Dict:
+    """Get signal summary for dataframe"""
+    engine = ConfluenceEngine()
+    score = engine.calculate_confluence(df)
+    return engine.get_signal_summary(score)
