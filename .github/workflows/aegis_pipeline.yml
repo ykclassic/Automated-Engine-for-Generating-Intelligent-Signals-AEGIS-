@@ -53,6 +53,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
+      - name: Create __init__.py files
+        run: |
+          touch src/__init__.py
+          touch src/core/__init__.py
+          touch src/indicators/__init__.py
+          touch src/ml/__init__.py
+          touch src/analysis/__init__.py
+          touch src/utils/__init__.py
+          touch src/notifications/__init__.py
+      
       - name: Create directories
         run: mkdir -p data/raw data/processed data/cache logs signals
       
@@ -68,72 +78,75 @@ jobs:
       
       - name: Fetch market data
         id: fetch_step
+        working-directory: ${{ github.workspace }}
         env:
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
           BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
           HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
           HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
+          PYTHONPATH: ${{ github.workspace }}/src
         run: |
           python -c "
           import sys
-          sys.path.insert(0, 'src')
-          import logging
           import os
+          import logging
           from pathlib import Path
           import traceback
           
-          logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+          # Setup paths
+          sys.path.insert(0, 'src')
+          os.chdir('${{ github.workspace }}')
           
-          # Import your data fetcher
+          logging.basicConfig(
+              level=logging.INFO,
+              format='%(asctime)s - %(levelname)s - %(message)s'
+          )
+          logger = logging.getLogger(__name__)
+          
+          # Import after path setup
           try:
               from core.data_fetcher import update_all_data
           except ImportError as e:
-              print(f'Import error: {e}')
-              print('Available files in src:')
-              import os
-              for root, dirs, files in os.walk('src'):
-                  for f in files:
-                      print(os.path.join(root, f))
+              logger.error(f'Import error: {e}')
+              traceback.print_exc()
               sys.exit(1)
+          
+          # Ensure data directory exists
+          Path('data/raw').mkdir(parents=True, exist_ok=True)
           
           data_count = 0
           has_data = False
           error_msg = None
           
           try:
-              print('Starting data fetch...')
-              data = update_all_data()
+              logger.info('Starting data fetch...')
+              result = update_all_data()
               
-              if data is None:
-                  print('WARNING: update_all_data() returned None')
-                  data = []
+              if result is None:
+                  logger.warning('update_all_data() returned None')
+                  result = {}
               
-              data_count = len(data) if hasattr(data, '__len__') else 0
+              data_count = len(result) if hasattr(result, '__len__') else 0
               has_data = data_count > 0
-              print(f'Success: {data_count} assets updated')
+              logger.info(f'Fetch returned {data_count} assets')
               
-              # Check if parquet files were actually created
-              raw_path = Path('data/raw')
-              parquet_files = list(raw_path.glob('*.parquet'))
-              print(f'Parquet files created: {len(parquet_files)}')
-              for f in parquet_files[:5]:  # Show first 5
-                  print(f'  - {f.name} ({f.stat().st_size} bytes)')
-                  
           except Exception as e:
               error_msg = str(e)
-              print(f'Fetch error: {e}')
+              logger.error(f'Fetch error: {e}')
               traceback.print_exc()
-              
-              # Try to use cached data
-              try:
-                  raw_path = Path('data/raw')
-                  parquet_files = list(raw_path.glob('*.parquet'))
-                  has_data = len(parquet_files) > 0
-                  data_count = len(parquet_files)
-                  print(f'Falling back to cache: {data_count} files')
-              except Exception as e2:
-                  print(f'Cache check failed: {e2}')
-                  has_data = False
+          
+          # CRITICAL: Check for actual parquet files on disk
+          raw_path = Path('data/raw')
+          parquet_files = list(raw_path.glob('*.parquet'))
+          file_count = len(parquet_files)
+          
+          logger.info(f'Parquet files found: {file_count}')
+          for f in parquet_files[:5]:
+              logger.info(f'  - {f.name} ({f.stat().st_size} bytes)')
+          
+          # Use file count as ground truth
+          has_data = file_count > 0
+          data_count = file_count
           
           # Write outputs
           output_file = os.environ.get('GITHUB_OUTPUT')
@@ -144,16 +157,8 @@ jobs:
                   if error_msg:
                       f.write(f'error_msg={error_msg[:100]}\n')
           
-          print(f'Final status: data_available={has_data}, count={data_count}')
+          logger.info(f'Final status: data_available={has_data}, count={data_count}')
           "
-      
-      - name: Debug - List data directory
-        run: |
-          echo "Contents of data/raw/:"
-          ls -lah data/raw/ 2>/dev/null || echo "Directory empty or missing"
-          echo ""
-          echo "Parquet files:"
-          find data/raw/ -name "*.parquet" -type f 2>/dev/null | head -10
       
       - name: Check data availability
         id: check_data
@@ -166,6 +171,7 @@ jobs:
             echo "data_available=true" >> $GITHUB_OUTPUT
             echo "data_count=$FILE_COUNT" >> $GITHUB_OUTPUT
             echo "status=success" >> $GITHUB_OUTPUT
+            ls -lh data/raw/*.parquet
           else
             echo "data_available=false" >> $GITHUB_OUTPUT
             echo "data_count=0" >> $GITHUB_OUTPUT
@@ -211,42 +217,39 @@ jobs:
           
           git checkout main || true
 
-  # Job 2: Calculate indicators - Runs when fetch-data succeeds
+  # Job 2: Calculate indicators
   calculate-indicators:
     runs-on: ubuntu-latest
     needs: fetch-data
     if: ${{ needs.fetch-data.result == 'success' }}
     
     steps:
-      - name: Debug - Check inputs
+      - name: Debug inputs
         run: |
           echo "Data available: '${{ needs.fetch-data.outputs.data_available }}'"
           echo "Data count: ${{ needs.fetch-data.outputs.data_count }}"
-          echo "Fetch result: ${{ needs.fetch-data.result }}"
       
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-      
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
+      - name: Create __init__.py files
+        run: |
+          touch src/__init__.py
+          touch src/core/__init__.py
+          touch src/indicators/__init__.py
+      
       - name: Create directories
-        run: mkdir -p data/raw data/processed data/cache logs
+        run: mkdir -p data/raw data/processed logs
       
       - name: Download data from artifact
         id: download_artifact
@@ -259,7 +262,7 @@ jobs:
       - name: Fallback to data branch
         if: needs.fetch-data.outputs.data_available != 'true'
         run: |
-          echo "No artifact available, trying data branch..."
+          echo "No artifact, trying data branch..."
           git fetch origin data-storage 2>/dev/null || true
           git checkout origin/data-storage -- data/raw/ 2>/dev/null || true
       
@@ -268,33 +271,31 @@ jobs:
         run: |
           FILE_COUNT=$(find data/raw -name "*.parquet" -type f 2>/dev/null | wc -l)
           echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
-          
-          if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "No data available - will generate empty signals"
-            echo "has_data=false" >> $GITHUB_OUTPUT
-          else
-            echo "Data available: $FILE_COUNT files"
-            echo "has_data=true" >> $GITHUB_OUTPUT
-            ls -lh data/raw/*.parquet | head -5
-          fi
+          echo "has_data=$([ $FILE_COUNT -gt 0 ] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "Found $FILE_COUNT files"
       
       - name: Generate signals
         id: generate
+        working-directory: ${{ github.workspace }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+          HAS_DATA: ${{ steps.verify_data.outputs.has_data }}
         run: |
           python -c "
           import sys
-          sys.path.insert(0, 'src')
-          
-          import json
           import os
+          import json
           import traceback
           from datetime import datetime
+          from pathlib import Path
+          
+          sys.path.insert(0, 'src')
           
           signals_data = []
           has_data = os.environ.get('HAS_DATA', 'false') == 'true'
           
           if not has_data:
-              print('No data available - generating empty signals file')
+              print('No data available - generating empty signals')
           else:
               try:
                   from core.data_fetcher import DataPipeline
@@ -307,7 +308,7 @@ jobs:
                   all_data = pipeline.fetch_all_assets()
                   
                   if not all_data:
-                      print('WARNING: No data returned from pipeline')
+                      print('WARNING: No data returned')
                   else:
                       print(f'Processing {len(all_data)} assets...')
                       
@@ -337,43 +338,36 @@ jobs:
                                       signals_data.append(signal_dict)
                                   except Exception as e:
                                       print(f'Error converting signal: {e}')
-                                      continue
                           except Exception as e:
                               print(f'Signal generation error: {e}')
                               traceback.print_exc()
-              
               except Exception as e:
                   print(f'Pipeline error: {e}')
                   traceback.print_exc()
           
           # Write outputs
-          os.makedirs('data/processed', exist_ok=True)
-          os.makedirs('signals', exist_ok=True)
+          Path('data/processed').mkdir(parents=True, exist_ok=True)
+          Path('signals').mkdir(parents=True, exist_ok=True)
           
-          output_path = 'data/processed/latest_signals.json'
-          with open(output_path, 'w') as f:
+          with open('data/processed/latest_signals.json', 'w') as f:
               json.dump(signals_data, f, indent=2, default=str)
           
           timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-          timestamp_path = f'signals/signals_{timestamp}.json'
-          with open(timestamp_path, 'w') as f:
+          with open(f'signals/signals_{timestamp}.json', 'w') as f:
               json.dump(signals_data, f, indent=2, default=str)
           
           # Set output
           with open(os.environ.get('GITHUB_OUTPUT'), 'a') as f:
               f.write(f'signal_count={len(signals_data)}\n')
-              f.write(f'has_data={str(has_data).lower()}\n')
           
           print(f'Saved {len(signals_data)} signals')
           "
-        env:
-          HAS_DATA: ${{ steps.verify_data.outputs.has_data }}
       
-      - name: Verify signals output
+      - name: Verify signals
         run: |
           if [ -f "data/processed/latest_signals.json" ]; then
             echo "✓ Signals file created"
-            cat data/processed/latest_signals.json | head -50
+            python -c "import json; print(f'Signals: {len(json.load(open(\\\"data/processed/latest_signals.json\\\")))}')"
           else
             echo "ERROR: Signals file not created"
             exit 1
@@ -395,25 +389,21 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           python -c "
-          import json
-          import requests
-          import os
+          import json, requests, os
           from datetime import datetime
           
           webhook = os.environ.get('DISCORD_WEBHOOK', '')
-          if not webhook:
-              exit(0)
+          if not webhook: exit(0)
           
           try:
               with open('data/processed/latest_signals.json') as f:
                   signals = json.load(f)
-          except:
-              signals = []
+          except: signals = []
           
           if not signals:
               embed = {
                   'title': '💓 AEGIS Heartbeat',
-                  'description': 'No signals generated',
+                  'description': 'No signals',
                   'color': 9807270,
                   'timestamp': datetime.utcnow().isoformat()
               }
@@ -440,7 +430,7 @@ jobs:
                   embed = {
                       'title': f\\\"{s.get('symbol')} {s.get('direction').upper()}\\\",\                      'color': color,
                       'fields': [
-                          {'name': 'Confidence', 'value': str(s.get('confidence_score', 0)), 'inline': True},
+                          {'name': 'Confidence', 'value': f\\\"{s.get('confidence_score', 0):.1%}\\\", 'inline': True},
                           {'name': 'Entry', 'value': str(s.get('entry_price', 0)), 'inline': True}
                       ]
                   }
@@ -493,18 +483,14 @@ jobs:
           
           if [ "$DATA" == "success" ] && [ "$INDICATOR" == "success" ]; then
             if [ "$DATA_AVAILABLE" == "true" ]; then
-              COLOR="3066993"
-              TITLE="✅ AEGIS Success"
+              COLOR="3066993"; TITLE="✅ AEGIS Success"
             else
-              COLOR="16776960"
-              TITLE="⚠️ AEGIS No Data"
+              COLOR="16776960"; TITLE="⚠️ AEGIS No Data"
             fi
           elif [ "$DATA" == "success" ]; then
-            COLOR="15158332"
-            TITLE="❌ AEGIS Signal Gen Failed"
+            COLOR="15158332"; TITLE="❌ AEGIS Signal Gen Failed"
           else
-            COLOR="15158332"
-            TITLE="❌ AEGIS Data Fetch Failed"
+            COLOR="15158332"; TITLE="❌ AEGIS Data Fetch Failed"
           fi
           
           curl -H "Content-Type: application/json" \
