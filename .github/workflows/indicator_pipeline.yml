@@ -18,27 +18,43 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4  # Updated to v4
       
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5  # Updated to v5
         with:
           python-version: '3.11'
       
+      - name: Cache Python dependencies
+        uses: actions/cache@v4  # Updated to v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
       
+      - name: Create directories
+        run: |
+          mkdir -p data/raw data/processed data/cache logs
+      
       - name: Download data artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4  # Updated to v4
         with:
           name: market-data
           path: data/raw
+          github-token: ${{ secrets.GITHUB_TOKEN }}  # v4 requires token
+          merge-multiple: true  # v4 option for multiple artifacts
       
       - name: Calculate indicators and confluence
         run: |
           python -c "
           import sys
+          import os
           sys.path.insert(0, 'src')
           
           from core.data_fetcher import DataPipeline
@@ -109,53 +125,46 @@ jobs:
                       continue
           
           # Save signals
+          os.makedirs('data/processed', exist_ok=True)
           with open('data/processed/latest_signals.json', 'w') as f:
               json.dump(signals, f, indent=2, default=str)
           
           print(f'Generated {len(signals)} signals')
           "
       
-      - name: Upload signals
-        uses: actions/upload-artifact@v3
+      - name: Upload processed signals
+        uses: actions/upload-artifact@v4  # Updated to v4
         with:
-          name: trading-signals
+          name: processed-signals
           path: data/processed/latest_signals.json
+          retention-days: 7
+          overwrite: true  # v4 requires explicit overwrite
       
-      - name: Send high-confidence alerts
+      - name: Report status to Discord
+        if: always()
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
-          python -c "
-          import json
-          import os
-          import requests
+          STATUS="${{ job.status }}"
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           
-          with open('data/processed/latest_signals.json') as f:
-              signals = json.load(f)
+          if [ "$STATUS" == "success" ]; then
+            COLOR="3066993"
+            TITLE="✅ Indicator Pipeline Success"
+          else
+            COLOR="15158332"
+            TITLE="❌ Indicator Pipeline Failed"
+          fi
           
-          webhook = os.environ['DISCORD_WEBHOOK']
-          
-          for signal in signals:
-              tf = signal['timeframe_confluence']
-              
-              # Only alert on high confidence
-              if tf['confidence'] in ['High', 'Very High'] and tf['direction'] != '⚪ NEUTRAL':
-                  color = 3066993 if 'BULLISH' in tf['direction'] else 15158332
-                  emoji = '🟢' if 'BULLISH' in tf['direction'] else '🔴'
-                  
-                  embed = {
-                      'title': f'{emoji} {signal[\"symbol\"]} Signal',
-                      'color': color,
-                      'fields': [
-                          {'name': 'Direction', 'value': tf['direction'], 'inline': True},
-                          {'name': 'Score', 'value': tf['score'], 'inline': True},
-                          {'name': 'Confidence', 'value': f\"{tf['confidence']} ({tf['confidence_value']})\", 'inline': True},
-                          {'name': 'Price', 'value': f\"${signal['price']:.2f}\", 'inline': True},
-                          {'name': 'Agreement', 'value': tf['agreement'], 'inline': True},
-                          {'name': 'Key Factors', 'value': ', '.join(tf.get('key_bullish', []) + tf.get('key_bearish', [])), 'inline': False}
-                      ],
-                      'timestamp': signal['timestamp']
-                  }
-                  
-                  requests.post(webhook, json={'embeds': [embed]})
-          "
+          curl -H "Content-Type: application/json" \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"$TITLE\",
+                \"color\": $COLOR,
+                \"timestamp\": \"$TIMESTAMP\",
+                \"fields\": [
+                  {\"name\": \"Run ID\", \"value\": \"${{ github.run_id }}\", \"inline\": true}
+                ]
+              }]
+            }" \
+            $DISCORD_WEBHOOK || true
