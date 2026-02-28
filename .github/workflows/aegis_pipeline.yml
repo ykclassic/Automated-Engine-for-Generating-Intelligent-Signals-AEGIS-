@@ -86,38 +86,35 @@ jobs:
           HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
           PYTHONPATH: ${{ github.workspace }}/src
         run: |
-          python -c "
+          python << 'PYEOF'
           import sys
           import os
           import logging
           from pathlib import Path
           import traceback
-          
-          # Setup paths
+
           sys.path.insert(0, 'src')
-          os.chdir('${{ github.workspace }}')
-          
+          os.chdir(os.environ.get('GITHUB_WORKSPACE', '.'))
+
           logging.basicConfig(
               level=logging.INFO,
               format='%(asctime)s - %(levelname)s - %(message)s'
           )
           logger = logging.getLogger(__name__)
-          
-          # Import after path setup
+
           try:
               from core.data_fetcher import update_all_data
           except ImportError as e:
               logger.error(f'Import error: {e}')
               traceback.print_exc()
               sys.exit(1)
-          
-          # Ensure data directory exists
+
           Path('data/raw').mkdir(parents=True, exist_ok=True)
-          
+
           data_count = 0
           has_data = False
           error_msg = None
-          
+
           try:
               logger.info('Starting data fetch...')
               result = update_all_data()
@@ -134,21 +131,18 @@ jobs:
               error_msg = str(e)
               logger.error(f'Fetch error: {e}')
               traceback.print_exc()
-          
-          # CRITICAL: Check for actual parquet files on disk
+
           raw_path = Path('data/raw')
           parquet_files = list(raw_path.glob('*.parquet'))
           file_count = len(parquet_files)
-          
+
           logger.info(f'Parquet files found: {file_count}')
           for f in parquet_files[:5]:
               logger.info(f'  - {f.name} ({f.stat().st_size} bytes)')
-          
-          # Use file count as ground truth
+
           has_data = file_count > 0
           data_count = file_count
-          
-          # Write outputs
+
           output_file = os.environ.get('GITHUB_OUTPUT')
           if output_file:
               with open(output_file, 'a') as f:
@@ -156,9 +150,9 @@ jobs:
                   f.write(f'data_count={data_count}\n')
                   if error_msg:
                       f.write(f'error_msg={error_msg[:100]}\n')
-          
+
           logger.info(f'Final status: data_available={has_data}, count={data_count}')
-          "
+          PYEOF
       
       - name: Check data availability
         id: check_data
@@ -281,19 +275,19 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/src
           HAS_DATA: ${{ steps.verify_data.outputs.has_data }}
         run: |
-          python -c "
+          python << 'PYEOF'
           import sys
           import os
           import json
           import traceback
           from datetime import datetime
           from pathlib import Path
-          
+
           sys.path.insert(0, 'src')
-          
+
           signals_data = []
           has_data = os.environ.get('HAS_DATA', 'false') == 'true'
-          
+
           if not has_data:
               print('No data available - generating empty signals')
           else:
@@ -344,29 +338,28 @@ jobs:
               except Exception as e:
                   print(f'Pipeline error: {e}')
                   traceback.print_exc()
-          
-          # Write outputs
+
           Path('data/processed').mkdir(parents=True, exist_ok=True)
           Path('signals').mkdir(parents=True, exist_ok=True)
-          
+
           with open('data/processed/latest_signals.json', 'w') as f:
               json.dump(signals_data, f, indent=2, default=str)
-          
+
           timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
           with open(f'signals/signals_{timestamp}.json', 'w') as f:
               json.dump(signals_data, f, indent=2, default=str)
-          
-          # Set output
+
           with open(os.environ.get('GITHUB_OUTPUT'), 'a') as f:
               f.write(f'signal_count={len(signals_data)}\n')
-          
+
           print(f'Saved {len(signals_data)} signals')
-          "
+          PYEOF
       
-            - name: Verify signals
+      - name: Verify signals
+        run: |
           if [ -f "data/processed/latest_signals.json" ]; then
             echo "✓ Signals file created"
-            python -c "import json; data=json.load(open('data/processed/latest_signals.json')); print(f'Signals: {len(data)}')"
+            python -c "import json; f=open('data/processed/latest_signals.json'); print('Signals:', len(json.load(f))); f.close()"
           else
             echo "ERROR: Signals file not created"
             exit 1
@@ -387,54 +380,60 @@ jobs:
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
-          python -c "
-          import json, requests, os
+          python << 'PYEOF'
+          import json
+          import requests
+          import os
           from datetime import datetime
-          
+
           webhook = os.environ.get('DISCORD_WEBHOOK', '')
-          if not webhook: exit(0)
-          
+          if not webhook:
+              exit(0)
+
           try:
               with open('data/processed/latest_signals.json') as f:
                   signals = json.load(f)
-          except: signals = []
-          
+          except:
+              signals = []
+
           if not signals:
               embed = {
                   'title': '💓 AEGIS Heartbeat',
-                  'description': 'No signals',
+                  'description': 'No signals generated',
                   'color': 9807270,
                   'timestamp': datetime.utcnow().isoformat()
               }
               requests.post(webhook, json={'embeds': [embed]})
               exit(0)
-          
+
           longs = sum(1 for s in signals if s.get('direction') == 'long')
           shorts = sum(1 for s in signals if s.get('direction') == 'short')
-          
+
           summary = {
-              'title': f'🛡️ {len(signals)} Signals',
+              'title': f'🛡️ {len(signals)} Signals Generated',
               'color': 3447003,
               'fields': [
                   {'name': '🟢 Long', 'value': str(longs), 'inline': True},
-                  {'name': '🔴 Short', 'value': str(shorts), 'inline': True}
+                  {'name': '🔴 Short', 'value': str(shorts), 'inline': True},
+                  {'name': '⏱️ Time', 'value': datetime.utcnow().strftime('%H:%M UTC'), 'inline': True}
               ],
               'timestamp': datetime.utcnow().isoformat()
           }
           requests.post(webhook, json={'embeds': [summary]})
-          
+
           for s in signals:
               if s.get('confidence') in ['high', 'very_high']:
                   color = 3066993 if s.get('direction') == 'long' else 15158332
                   embed = {
-                      'title': f\\\"{s.get('symbol')} {s.get('direction').upper()}\\\",\                      'color': color,
+                      'title': f"{s.get('symbol', 'Unknown')} {s.get('direction', 'neutral').upper()}",
+                      'color': color,
                       'fields': [
-                          {'name': 'Confidence', 'value': f\\\"{s.get('confidence_score', 0):.1%}\\\", 'inline': True},
-                          {'name': 'Entry', 'value': str(s.get('entry_price', 0)), 'inline': True}
+                          {'name': 'Confidence', 'value': f"{s.get('confidence_score', 0):.1%}", 'inline': True},
+                          {'name': 'Entry', 'value': f"{s.get('entry_price', 0):.4f}", 'inline': True}
                       ]
                   }
                   requests.post(webhook, json={'embeds': [embed]})
-          "
+          PYEOF
       
       - name: Commit signals
         if: always()
@@ -482,14 +481,18 @@ jobs:
           
           if [ "$DATA" == "success" ] && [ "$INDICATOR" == "success" ]; then
             if [ "$DATA_AVAILABLE" == "true" ]; then
-              COLOR="3066993"; TITLE="✅ AEGIS Success"
+              COLOR="3066993"
+              TITLE="✅ AEGIS Success"
             else
-              COLOR="16776960"; TITLE="⚠️ AEGIS No Data"
+              COLOR="16776960"
+              TITLE="⚠️ AEGIS No Data"
             fi
           elif [ "$DATA" == "success" ]; then
-            COLOR="15158332"; TITLE="❌ AEGIS Signal Gen Failed"
+            COLOR="15158332"
+            TITLE="❌ AEGIS Signal Gen Failed"
           else
-            COLOR="15158332"; TITLE="❌ AEGIS Data Fetch Failed"
+            COLOR="15158332"
+            TITLE="❌ AEGIS Data Fetch Failed"
           fi
           
           curl -H "Content-Type: application/json" \
