@@ -298,4 +298,192 @@ class MLFeatureEngineer:
         """
         Calculate volume features for ML
         """
-        df
+        df = df.copy()
+        
+        # Volume moving averages
+        for window in [5, 20, 50]:
+            df[f'volume_sma_{window}'] = df['volume'].rolling(window).mean()
+            df[f'volume_ratio_{window}'] = df['volume'] / df[f'volume_sma_{window}']
+        
+        # Relative volume
+        df['relative_volume'] = df['volume'] / df['volume_sma_20']
+        df['high_volume'] = (df['relative_volume'] > 2.0).astype(int)
+        
+        # Volume trend
+        df['volume_trend'] = np.where(
+            df['volume'] > df['volume'].shift(1) * 1.5, 2,
+            np.where(df['volume'] > df['volume'].shift(1), 1,
+                    np.where(df['volume'] < df['volume'].shift(1) * 0.5, -2, -1))
+        )
+        
+        # On-Balance Volume
+        df['obv'] = (np.sign(df['close'].diff()) * df['volume']).cumsum()
+        df['obv_sma'] = df['obv'].rolling(window=20).mean()
+        df['obv_slope'] = df['obv'].diff(5)
+        df['obv_divergence'] = np.where(
+            (df['close'] > df['close'].shift(5)) & (df['obv'] < df['obv'].shift(5)), -1,
+            np.where((df['close'] < df['close'].shift(5)) & (df['obv'] > df['obv'].shift(5)), 1, 0)
+        )
+        
+        # VWAP
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        df['vwap'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
+        df['vwap_dist'] = (df['close'] - df['vwap']) / df['vwap']
+        
+        # Volume-Price confirmation
+        df['volume_price_confirm'] = np.where(
+            (df['close'] > df['close'].shift(1)) & (df['volume'] > df['volume'].shift(1)), 1,
+            np.where((df['close'] < df['close'].shift(1)) & (df['volume'] > df['volume'].shift(1)), -1, 0)
+        )
+        
+        return df
+    
+    def calculate_target_variable(
+        self,
+        df: pd.DataFrame,
+        lookahead: int = 5,
+        threshold: float = 0.01
+    ) -> pd.DataFrame:
+        """
+        Create target variable for supervised learning
+        Classes: 1 (up), 0 (neutral), -1 (down)
+        """
+        df = df.copy()
+        
+        # Future returns
+        future_return = df['close'].shift(-lookahead) / df['close'] - 1
+        
+        # Classification target
+        df['target'] = np.where(
+            future_return > threshold, 1,
+            np.where(future_return < -threshold, -1, 0)
+        )
+        
+        # Regression target (for probability calibration)
+        df['target_return'] = future_return
+        
+        return df
+    
+    def create_feature_matrix(
+        self,
+        df: pd.DataFrame,
+        include_target: bool = True
+    ) -> pd.DataFrame:
+        """
+        Create complete feature matrix with all features
+        """
+        df = df.copy()
+        
+        # Calculate all feature groups
+        df = self.calculate_returns_features(df)
+        df = self.calculate_trend_features(df)
+        df = self.calculate_momentum_features(df)
+        df = self.calculate_volatility_features(df)
+        df = self.calculate_volume_features(df)
+        
+        # Create target if requested
+        if include_target:
+            df = self.calculate_target_variable(df)
+        
+        # Select final feature set
+        feature_cols = []
+        
+        # Price action
+        feature_cols.extend([
+            'returns', 'log_returns', 'returns_5d', 'returns_20d',
+            'returns_mean_20', 'returns_std_20', 'returns_skew_20',
+            'price_range_position'
+        ])
+        
+        # Trend
+        feature_cols.extend([
+            'ema_8_dist', 'ema_21_dist', 'ema_50_dist',
+            'ema_8_21_cross', 'ema_21_50_cross',
+            'macd', 'macd_hist', 'macd_normalized',
+            'adx', 'di_diff', 'trend_alignment'
+        ])
+        
+        # Momentum
+        feature_cols.extend([
+            'rsi', 'rsi_normalized', 'rsi_slope',
+            'stoch_k', 'stoch_d', 'stoch_cross',
+            'williams_r', 'cci', 'roc_10',
+            'momentum_composite', 'price_momentum_divergence'
+        ])
+        
+        # Volatility
+        feature_cols.extend([
+            'atr_pct', 'atr_normalized',
+            'bb_width', 'bb_position', 'bb_squeeze',
+            'hist_vol_20', 'volatility_regime', 'vol_clustering'
+        ])
+        
+        # Volume
+        feature_cols.extend([
+            'relative_volume', 'volume_trend',
+            'obv_slope', 'obv_divergence',
+            'vwap_dist', 'volume_price_confirm'
+        ])
+        
+        # Filter to existing columns
+        available_cols = [c for c in feature_cols if c in df.columns]
+        
+        if include_target and 'target' in df.columns:
+            available_cols.extend(['target', 'target_return'])
+        
+        return df[available_cols].dropna()
+    
+    def scale_features(
+        self,
+        df: pd.DataFrame,
+        fit: bool = True
+    ) -> pd.DataFrame:
+        """
+        Scale features using StandardScaler
+        """
+        feature_cols = [c for c in df.columns if c not in ['target', 'target_return']]
+        
+        if fit:
+            scaled = self.scaler.fit_transform(df[feature_cols])
+        else:
+            scaled = self.scaler.transform(df[feature_cols])
+        
+        df_scaled = pd.DataFrame(scaled, columns=feature_cols, index=df.index)
+        
+        # Add back target columns
+        if 'target' in df.columns:
+            df_scaled['target'] = df['target']
+        if 'target_return' in df.columns:
+            df_scaled['target_return'] = df['target_return']
+        
+        return df_scaled
+    
+    def get_feature_importance_mask(
+        self,
+        df: pd.DataFrame,
+        top_n: int = 30
+    ) -> List[str]:
+        """
+        Get mask of most important features based on mutual information
+        """
+        from sklearn.feature_selection import mutual_info_classif
+        
+        feature_cols = [c for c in df.columns if c not in ['target', 'target_return']]
+        X = df[feature_cols].dropna()
+        y = df.loc[X.index, 'target']
+        
+        # Calculate mutual information
+        mi = mutual_info_classif(X, y, random_state=42)
+        
+        # Get top features
+        feature_mi = list(zip(feature_cols, mi))
+        feature_mi.sort(key=lambda x: x[1], reverse=True)
+        
+        return [f[0] for f in feature_mi[:top_n]]
+
+
+# Convenience function
+def engineer_ml_features(df: pd.DataFrame, include_target: bool = True) -> pd.DataFrame:
+    """Quick ML feature engineering"""
+    engineer = MLFeatureEngineer()
+    return engineer.create_feature_matrix(df, include_target)
