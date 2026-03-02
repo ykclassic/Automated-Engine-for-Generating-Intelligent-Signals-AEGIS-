@@ -3,10 +3,16 @@ AEGIS Indicators Module
 Centralized indicator calculation and management
 """
 
+import pandas as pd  # <--- FIXED: Added missing import
+import logging
+
 from .trend import TrendIndicators
 from .momentum import MomentumIndicators
 from .volatility import VolatilityIndicators
 from .volume import VolumeIndicators
+
+# Setup logger for the module
+logger = logging.getLogger(__name__)
 
 __all__ = [
     'TrendIndicators',
@@ -28,6 +34,7 @@ class IndicatorOrchestrator:
         self.momentum = MomentumIndicators()
         self.volatility = VolatilityIndicators()
         self.volume = VolumeIndicators()
+        logger.info("IndicatorOrchestrator initialized with sub-modules.")
     
     def calculate_all(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -37,19 +44,25 @@ class IndicatorOrchestrator:
         3. Momentum (needs volatility for normalization)
         4. Volume (independent but uses price)
         """
+        if df is None or df.empty:
+            return df
+
         df = df.copy()
         
-        # Step 1: Trend indicators (foundational)
-        df = self.trend.calculate_all(df)
-        
-        # Step 2: Volatility (uses price and trend)
-        df = self.volatility.calculate_all(df)
-        
-        # Step 3: Momentum (uses trend and volatility info)
-        df = self.momentum.calculate_all(df)
-        
-        # Step 4: Volume indicators
-        df = self.volume.calculate_all(df)
+        try:
+            # Step 1: Trend indicators (foundational)
+            df = self.trend.calculate_all(df)
+            
+            # Step 2: Volatility (uses price and trend)
+            df = self.volatility.calculate_all(df)
+            
+            # Step 3: Momentum (uses trend and volatility info)
+            df = self.momentum.calculate_all(df)
+            
+            # Step 4: Volume indicators
+            df = self.volume.calculate_all(df)
+        except Exception as e:
+            logger.error(f"Failed to calculate indicators: {e}")
         
         return df
     
@@ -57,6 +70,9 @@ class IndicatorOrchestrator:
         """
         Get summary of current indicator values
         """
+        if df.empty:
+            return {}
+
         latest = df.iloc[-1]
         
         return {
