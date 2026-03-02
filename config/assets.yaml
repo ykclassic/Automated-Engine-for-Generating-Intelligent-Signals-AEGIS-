@@ -52,7 +52,7 @@ categories:
         spread_max: 0.003
         
       MATICUSDT:
-        display_name: "MATIC/USDT"
+        display_name: "POL/USDT"
         min_volume_24h: 40000000
         spread_max: 0.003
         
