@@ -17,9 +17,14 @@ jobs:
 
       - name: Setup Environment
         run: |
+          # Install core data science stack
           pip install pandas numpy scipy pyyaml pyarrow structlog
-          mkdir -p data/processed data/raw
-          touch src/__init__.py src/core/__init__.py src/indicators/__init__.py
+          
+          # CRITICAL: Create directory structure and init files
+          mkdir -p data/processed data/raw src/core src/indicators
+          touch src/__init__.py
+          touch src/core/__init__.py
+          touch src/indicators/__init__.py
 
       - name: Download Market Data
         uses: actions/download-artifact@v4
@@ -36,29 +41,34 @@ jobs:
           from pathlib import Path
           from src.core.signal_generator import SignalGenerator
 
-          # Now initializing with the correct keyword argument
+          # Moderate risk for standard runs
           gen = SignalGenerator(min_confidence=0.65, risk_level='moderate')
           all_signals = []
           
-          files = list(Path("data/raw").glob("*.parquet"))
-          print(f"--- Processing {len(files)} Assets ---")
+          data_files = list(Path("data/raw").glob("*.parquet"))
+          print(f"--- AEGIS: Analyzing {len(data_files)} assets ---")
           
-          for f in files:
+          for f in data_files:
               try:
                   df = pd.read_parquet(f)
+                  # Extract symbol: e.g. BTC_USDT_1h.parquet -> BTC/USDT
                   symbol = f.stem.split('_')[0] + "/USDT"
-                  signals = gen.generate_signals(df, symbol, account_balance=5000.0)
+                  
+                  signals = gen.generate_signals(df, symbol, account_balance=10000.0)
                   all_signals.extend(signals)
                   if signals:
-                      print(f"🎯 {symbol} {signals[0]['direction']} generated.")
+                      print(f"🎯 SIGNAL GENERATED: {symbol} | {signals[0]['direction']}")
               except Exception as e:
-                  print(f"❌ Error on {f.name}: {e}")
+                  print(f"❌ Critical Error on {f.name}: {e}")
 
+          # Save for Discord/Streamlit
           with open("data/processed/latest_signals.json", "w") as out:
               json.dump(all_signals, out, indent=2)
+          
+          print(f"--- Pipeline Finished. Signals: {len(all_signals)} ---")
           PYEOF
 
-      - name: Upload for Streamlit
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: aegis-signals
