@@ -3,14 +3,28 @@ import pandas as pd
 from typing import Dict, List, Optional
 from datetime import datetime
 from pathlib import Path
+import sys
 
-# AEGIS Internal Imports
+# Ensure the root is in sys.path
+root_path = Path(__file__).resolve().parent.parent.parent
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+# Robust Import Logic
 try:
+    # Try absolute package import
     from src.indicators import IndicatorOrchestrator
     from src.core.risk_management import RiskManager, RiskLevel
 except ImportError:
-    from indicators import IndicatorOrchestrator
-    from risk_management import RiskManager, RiskLevel
+    try:
+        # Try local sibling import
+        from indicators import IndicatorOrchestrator
+        from risk_management import RiskManager, RiskLevel
+    except ImportError:
+        # Final fallback: manual path injection for sibling
+        sys.path.append(str(Path(__file__).parent))
+        from indicators import IndicatorOrchestrator
+        from risk_management import RiskManager, RiskLevel
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +36,7 @@ class SignalGenerator:
     def __init__(self, min_confidence: float = 0.65, risk_level: str = 'moderate'):
         self.orchestrator = IndicatorOrchestrator()
         
-        # Map string from workflow to the Enum in your Risk Module
+        # Mapping string input to the RiskLevel Enum
         risk_map = {
             'conservative': RiskLevel.CONSERVATIVE,
             'moderate': RiskLevel.MODERATE,
@@ -30,7 +44,7 @@ class SignalGenerator:
         }
         selected_level = risk_map.get(risk_level.lower(), RiskLevel.MODERATE)
         
-        # Initialize your Risk Manager
+        # Initialize Risk Manager
         self.risk_manager = RiskManager(risk_level=selected_level)
         self.min_confidence = min_confidence
 
@@ -48,14 +62,13 @@ class SignalGenerator:
         if df is None or df.empty or len(df) < 50:
             return []
 
-        # 1. Calculate Indicators
         df = self.orchestrator.calculate_all(df)
         latest = df.iloc[-1]
         
-        # 2. Check for Circuit Breakers
+        # Check Risk Manager for global blocks
         can_trade, reason = self.risk_manager.can_trade()
         if not can_trade:
-            logger.warning(f"Risk Manager Halt: {reason}")
+            logger.warning(f"Risk Block for {symbol}: {reason}")
             return []
 
         confidence = self._calculate_confluence(latest)
@@ -64,15 +77,14 @@ class SignalGenerator:
         if not direction:
             return []
 
-        # 3. Calculate Position Sizing using your Risk Module logic
         entry_price = float(latest['close'])
         atr = latest.get('atr', entry_price * 0.02)
         
-        # Define SL/TP based on ATR
+        # SL/TP Setup
         sl = entry_price - (atr * 2) if direction == "LONG" else entry_price + (atr * 2)
         tp = entry_price + (atr * 4) if direction == "LONG" else entry_price - (atr * 4)
 
-        # Use your RiskManager's Kelly Criterion logic
+        # Institutional Position Sizing via Kelly Criterion
         sizing = self.risk_manager.calculate_position_size(
             symbol=symbol,
             direction=direction,
@@ -90,12 +102,11 @@ class SignalGenerator:
             'entry_price': entry_price,
             'confidence': confidence,
             'risk_metrics': {
-                'position_size_units': round(sizing.size_units, 4),
+                'position_size_units': round(sizing.size_units, 8),
                 'position_size_pct': f"{sizing.size_pct:.2%}",
                 'leverage': sizing.leverage,
                 'stop_loss': round(sizing.stop_loss_price, 2),
                 'take_profit': round(sizing.take_profit_price, 2),
                 'risk_reward': round(sizing.risk_reward_ratio, 2)
-            },
-            'indicator_snapshot': self.orchestrator.get_indicator_summary(df)
+            }
         }]
