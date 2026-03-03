@@ -1,510 +1,65 @@
-name: AEGIS Complete Pipeline
+name: AEGIS Production Pipeline
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
-  
+    - cron: '0 * * * *'
   workflow_dispatch:
-  
-  push:
-    branches:
-      - main
-    paths:
-      - 'src/**'
-      - 'config/**'
-      - '.github/workflows/aegis_pipeline.yml'
-
-permissions:
-  contents: write
-  actions: read
-
-env:
-  PYTHON_VERSION: '3.11'
-  ARTIFACT_NAME: market-data
 
 jobs:
-  # Job 1: Fetch market data
-  fetch-data:
+  trade_engine:
     runs-on: ubuntu-latest
-    
-    outputs:
-      data_available: ${{ steps.check_data.outputs.data_available }}
-      data_count: ${{ steps.check_data.outputs.data_count }}
+    env:
+      PYTHONPATH: ${{ github.workspace }}
     
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-      
-      - name: Install dependencies
+
+      - name: Setup Environment
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      
-      - name: Create __init__.py files
-        run: |
-          touch src/__init__.py
-          touch src/core/__init__.py
-          touch src/indicators/__init__.py
-          touch src/ml/__init__.py
-          touch src/analysis/__init__.py
-          touch src/utils/__init__.py
-          touch src/notifications/__init__.py
-      
-      - name: Create directories
-        run: mkdir -p data/raw data/processed data/cache logs signals
-      
-      - name: Restore data from branch
-        run: |
-          git fetch origin data-storage 2>/dev/null || echo "No data-storage branch"
-          if git show-ref --verify --quiet refs/remotes/origin/data-storage 2>/dev/null; then
-            git checkout origin/data-storage -- data/raw/ 2>/dev/null || true
-            git checkout origin/data-storage -- data/processed/ 2>/dev/null || true
-          fi
-          echo "Existing data files:"
-          ls -la data/raw/ 2>/dev/null || echo "No existing data"
-      
-      - name: Fetch market data
-        id: fetch_step
-        working-directory: ${{ github.workspace }}
-        env:
-          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
-          BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
-          HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
-          HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
-          PYTHONPATH: ${{ github.workspace }}/src
-        run: |
-          python << 'PYEOF'
-          import sys
-          import os
-          import logging
-          from pathlib import Path
-          import traceback
+          pip install pandas numpy scipy pyyaml pyarrow structlog
+          mkdir -p data/processed data/raw
+          touch src/__init__.py src/core/__init__.py src/indicators/__init__.py
 
-          sys.path.insert(0, 'src')
-          os.chdir(os.environ.get('GITHUB_WORKSPACE', '.'))
-
-          logging.basicConfig(
-              level=logging.INFO,
-              format='%(asctime)s - %(levelname)s - %(message)s'
-          )
-          logger = logging.getLogger(__name__)
-
-          try:
-              from core.data_fetcher import update_all_data
-          except ImportError as e:
-              logger.error(f'Import error: {e}')
-              traceback.print_exc()
-              sys.exit(1)
-
-          Path('data/raw').mkdir(parents=True, exist_ok=True)
-
-          data_count = 0
-          has_data = False
-          error_msg = None
-
-          try:
-              logger.info('Starting data fetch...')
-              result = update_all_data()
-              
-              if result is None:
-                  logger.warning('update_all_data() returned None')
-                  result = {}
-              
-              data_count = len(result) if hasattr(result, '__len__') else 0
-              has_data = data_count > 0
-              logger.info(f'Fetch returned {data_count} assets')
-              
-          except Exception as e:
-              error_msg = str(e)
-              logger.error(f'Fetch error: {e}')
-              traceback.print_exc()
-
-          raw_path = Path('data/raw')
-          parquet_files = list(raw_path.glob('*.parquet'))
-          file_count = len(parquet_files)
-
-          logger.info(f'Parquet files found: {file_count}')
-          for f in parquet_files[:5]:
-              logger.info(f'  - {f.name} ({f.stat().st_size} bytes)')
-
-          has_data = file_count > 0
-          data_count = file_count
-
-          output_file = os.environ.get('GITHUB_OUTPUT')
-          if output_file:
-              with open(output_file, 'a') as f:
-                  f.write(f'data_available={str(has_data).lower()}\n')
-                  f.write(f'data_count={data_count}\n')
-                  if error_msg:
-                      f.write(f'error_msg={error_msg[:100]}\n')
-
-          logger.info(f'Final status: data_available={has_data}, count={data_count}')
-          PYEOF
-      
-      - name: Check data availability
-        id: check_data
-        if: always()
-        run: |
-          FILE_COUNT=$(find data/raw -name "*.parquet" -type f 2>/dev/null | wc -l)
-          echo "Found $FILE_COUNT parquet files"
-          
-          if [ "$FILE_COUNT" -gt 0 ]; then
-            echo "data_available=true" >> $GITHUB_OUTPUT
-            echo "data_count=$FILE_COUNT" >> $GITHUB_OUTPUT
-            echo "status=success" >> $GITHUB_OUTPUT
-            ls -lh data/raw/*.parquet
-          else
-            echo "data_available=false" >> $GITHUB_OUTPUT
-            echo "data_count=0" >> $GITHUB_OUTPUT
-            echo "status=failed" >> $GITHUB_OUTPUT
-            echo "WARNING: No parquet files found!"
-          fi
-      
-      - name: Upload data artifacts
-        if: steps.check_data.outputs.data_available == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: data/raw/*.parquet
-          retention-days: 1
-          overwrite: true
-      
-      - name: Commit data to branch
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          git fetch origin
-          
-          if git show-ref --verify --quiet refs/remotes/origin/data-storage; then
-            git checkout data-storage
-            git rm -rf . 2>/dev/null || true
-          else
-            git checkout --orphan data-storage
-          fi
-          
-          git checkout main -- data/raw/ 2>/dev/null || true
-          git checkout main -- data/processed/ 2>/dev/null || true
-          
-          git add data/ 2>/dev/null || true
-          
-          if ! git diff --cached --quiet; then
-            git commit -m "Update data - $(date -u) [run: ${{ github.run_id }}]"
-            git push "https://${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" data-storage || true
-          fi
-          
-          git checkout main || true
-
-  # Job 2: Calculate indicators
-  calculate-indicators:
-    runs-on: ubuntu-latest
-    needs: fetch-data
-    if: ${{ needs.fetch-data.result == 'success' }}
-    
-    steps:
-      - name: Debug inputs
-        run: |
-          echo "Data available: '${{ needs.fetch-data.outputs.data_available }}'"
-          echo "Data count: ${{ needs.fetch-data.outputs.data_count }}"
-      
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      
-      - name: Create __init__.py files
-        run: |
-          touch src/__init__.py
-          touch src/core/__init__.py
-          touch src/indicators/__init__.py
-      
-      - name: Create directories
-        run: mkdir -p data/raw data/processed logs
-      
-      - name: Download data from artifact
-        id: download_artifact
-        if: needs.fetch-data.outputs.data_available == 'true'
+      - name: Download Market Data
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
+          name: market-data
           path: data/raw
-      
-      - name: Fallback to data branch
-        if: needs.fetch-data.outputs.data_available != 'true'
-        run: |
-          echo "No artifact, trying data branch..."
-          git fetch origin data-storage 2>/dev/null || true
-          git checkout origin/data-storage -- data/raw/ 2>/dev/null || true
-      
-      - name: Verify data
-        id: verify_data
-        run: |
-          FILE_COUNT=$(find data/raw -name "*.parquet" -type f 2>/dev/null | wc -l)
-          echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
-          echo "has_data=$([ $FILE_COUNT -gt 0 ] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
-          echo "Found $FILE_COUNT files"
-      
-      - name: Generate signals
-        id: generate
-        working-directory: ${{ github.workspace }}
-        env:
-          PYTHONPATH: ${{ github.workspace }}/src
-          HAS_DATA: ${{ steps.verify_data.outputs.has_data }}
+        continue-on-error: true
+
+      - name: Execute AEGIS Logic
         run: |
           python << 'PYEOF'
-          import sys
-          import os
           import json
-          import traceback
-          from datetime import datetime
+          import pandas as pd
           from pathlib import Path
+          from src.core.signal_generator import SignalGenerator
 
-          sys.path.insert(0, 'src')
-
-          signals_data = []
-          has_data = os.environ.get('HAS_DATA', 'false') == 'true'
-
-          if not has_data:
-              print('No data available - generating empty signals')
-          else:
+          # Now initializing with the correct keyword argument
+          gen = SignalGenerator(min_confidence=0.65, risk_level='moderate')
+          all_signals = []
+          
+          files = list(Path("data/raw").glob("*.parquet"))
+          print(f"--- Processing {len(files)} Assets ---")
+          
+          for f in files:
               try:
-                  from core.data_fetcher import DataPipeline
-                  from core.signal_generator import SignalGenerator
-                  
-                  print('Initializing pipeline...')
-                  pipeline = DataPipeline()
-                  
-                  print('Fetching all assets...')
-                  all_data = pipeline.fetch_all_assets()
-                  
-                  if not all_data:
-                      print('WARNING: No data returned')
-                  else:
-                      print(f'Processing {len(all_data)} assets...')
-                      
-                      try:
-                          generator = SignalGenerator(risk_level='moderate', use_ml=False)
-                      except Exception as e:
-                          print(f'Generator init error: {e}')
-                          generator = None
-                      
-                      if generator and all_data:
-                          try:
-                              signals = generator.generate_all_signals(all_data, 10000)
-                              print(f'Generated {len(signals)} signals')
-                              
-                              for s in signals:
-                                  try:
-                                      signal_dict = {
-                                          'timestamp': datetime.utcnow().isoformat(),
-                                          'symbol': getattr(s, 'symbol', 'unknown'),
-                                          'direction': getattr(s, 'direction', 'neutral'),
-                                          'confidence': getattr(s, 'confidence', 'low'),
-                                          'confidence_score': float(getattr(s, 'confidence_score', 0)),
-                                          'entry_price': float(getattr(s, 'entry_price', 0)),
-                                          'stop_loss': float(getattr(s, 'stop_loss', 0)),
-                                          'take_profit': float(getattr(s, 'take_profit', 0))
-                                      }
-                                      signals_data.append(signal_dict)
-                                  except Exception as e:
-                                      print(f'Error converting signal: {e}')
-                          except Exception as e:
-                              print(f'Signal generation error: {e}')
-                              traceback.print_exc()
+                  df = pd.read_parquet(f)
+                  symbol = f.stem.split('_')[0] + "/USDT"
+                  signals = gen.generate_signals(df, symbol, account_balance=5000.0)
+                  all_signals.extend(signals)
+                  if signals:
+                      print(f"🎯 {symbol} {signals[0]['direction']} generated.")
               except Exception as e:
-                  print(f'Pipeline error: {e}')
-                  traceback.print_exc()
+                  print(f"❌ Error on {f.name}: {e}")
 
-          Path('data/processed').mkdir(parents=True, exist_ok=True)
-          Path('signals').mkdir(parents=True, exist_ok=True)
-
-          with open('data/processed/latest_signals.json', 'w') as f:
-              json.dump(signals_data, f, indent=2, default=str)
-
-          timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-          with open(f'signals/signals_{timestamp}.json', 'w') as f:
-              json.dump(signals_data, f, indent=2, default=str)
-
-          with open(os.environ.get('GITHUB_OUTPUT'), 'a') as f:
-              f.write(f'signal_count={len(signals_data)}\n')
-
-          print(f'Saved {len(signals_data)} signals')
+          with open("data/processed/latest_signals.json", "w") as out:
+              json.dump(all_signals, out, indent=2)
           PYEOF
-      
-      - name: Verify signals
-        run: |
-          if [ -f "data/processed/latest_signals.json" ]; then
-            echo "✓ Signals file created"
-            python -c "import json; f=open('data/processed/latest_signals.json'); print('Signals:', len(json.load(f))); f.close()"
-          else
-            echo "ERROR: Signals file not created"
-            exit 1
-          fi
-      
-      - name: Upload signals
+
+      - name: Upload for Streamlit
         uses: actions/upload-artifact@v4
         with:
-          name: trading-signals
-          path: |
-            data/processed/latest_signals.json
-            signals/signals_*.json
-          retention-days: 7
-          overwrite: true
-      
-      - name: Send to Discord
-        if: success()
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: |
-          python << 'PYEOF'
-          import json
-          import requests
-          import os
-          from datetime import datetime
-
-          webhook = os.environ.get('DISCORD_WEBHOOK', '')
-          if not webhook:
-              exit(0)
-
-          try:
-              with open('data/processed/latest_signals.json') as f:
-                  signals = json.load(f)
-          except:
-              signals = []
-
-          if not signals:
-              embed = {
-                  'title': '💓 AEGIS Heartbeat',
-                  'description': 'No signals generated',
-                  'color': 9807270,
-                  'timestamp': datetime.utcnow().isoformat()
-              }
-              requests.post(webhook, json={'embeds': [embed]})
-              exit(0)
-
-          longs = sum(1 for s in signals if s.get('direction') == 'long')
-          shorts = sum(1 for s in signals if s.get('direction') == 'short')
-
-          summary = {
-              'title': f'🛡️ {len(signals)} Signals Generated',
-              'color': 3447003,
-              'fields': [
-                  {'name': '🟢 Long', 'value': str(longs), 'inline': True},
-                  {'name': '🔴 Short', 'value': str(shorts), 'inline': True},
-                  {'name': '⏱️ Time', 'value': datetime.utcnow().strftime('%H:%M UTC'), 'inline': True}
-              ],
-              'timestamp': datetime.utcnow().isoformat()
-          }
-          requests.post(webhook, json={'embeds': [summary]})
-
-          for s in signals:
-              if s.get('confidence') in ['high', 'very_high']:
-                  color = 3066993 if s.get('direction') == 'long' else 15158332
-                  embed = {
-                      'title': f"{s.get('symbol', 'Unknown')} {s.get('direction', 'neutral').upper()}",
-                      'color': color,
-                      'fields': [
-                          {'name': 'Confidence', 'value': f"{s.get('confidence_score', 0):.1%}", 'inline': True},
-                          {'name': 'Entry', 'value': f"{s.get('entry_price', 0):.4f}", 'inline': True}
-                      ]
-                  }
-                  requests.post(webhook, json={'embeds': [embed]})
-          PYEOF
-      
-      - name: Commit signals
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          git fetch origin
-          
-          if git show-ref --verify --quiet refs/remotes/origin/data-storage; then
-            git checkout data-storage
-          else
-            git checkout --orphan data-storage
-            git rm -rf . 2>/dev/null || true
-          fi
-          
-          git checkout main -- data/processed/ 2>/dev/null || true
-          git checkout main -- signals/ 2>/dev/null || true
-          
-          git add data/processed/ signals/ 2>/dev/null || true
-          
-          if ! git diff --cached --quiet; then
-            git commit -m "Signals - $(date -u) [${{ github.run_id }}]"
-            git push "https://${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" data-storage || true
-          fi
-          
-          git checkout main || true
-
-  # Job 3: Report status
-  report-status:
-    runs-on: ubuntu-latest
-    needs: [fetch-data, calculate-indicators]
-    if: always()
-    
-    steps:
-      - name: Report status
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: |
-          DATA="${{ needs.fetch-data.result }}"
-          INDICATOR="${{ needs.calculate-indicators.result }}"
-          DATA_AVAILABLE="${{ needs.fetch-data.outputs.data_available }}"
-          
-          if [ "$DATA" == "success" ] && [ "$INDICATOR" == "success" ]; then
-            if [ "$DATA_AVAILABLE" == "true" ]; then
-              COLOR="3066993"
-              TITLE="✅ AEGIS Success"
-            else
-              COLOR="16776960"
-              TITLE="⚠️ AEGIS No Data"
-            fi
-          elif [ "$DATA" == "success" ]; then
-            COLOR="15158332"
-            TITLE="❌ AEGIS Signal Gen Failed"
-          else
-            COLOR="15158332"
-            TITLE="❌ AEGIS Data Fetch Failed"
-          fi
-          
-          curl -H "Content-Type: application/json" \
-            -d "{
-              \"embeds\": [{
-                \"title\": \"$TITLE\",
-                \"color\": $COLOR,
-                \"fields\": [
-                  {\"name\": \"Data\", \"value\": \"$DATA\", \"inline\": true},
-                  {\"name\": \"Signals\", \"value\": \"$INDICATOR\", \"inline\": true},
-                  {\"name\": \"Available\", \"value\": \"$DATA_AVAILABLE\", \"inline\": true}
-                ]
-              }]
-            }" \
-            $DISCORD_WEBHOOK 2>/dev/null || echo "Discord failed"
+          name: aegis-signals
+          path: data/processed/latest_signals.json
