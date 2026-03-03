@@ -1,4 +1,4 @@
-name: AEGIS Alpha Signal Pipeline
+ name: AEGIS Alpha Signal Pipeline
 
 on:
   schedule:
@@ -10,16 +10,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Install Fetcher Deps
-        run: pip install pandas ccxt pyyaml pyarrow
+          
+      - name: Install Fetcher Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pandas ccxt pyyaml pyarrow tenacity
+          
       - name: Run Fetcher
         run: |
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           python src/core/data_fetcher.py
+          
       - name: Upload Raw Data
         uses: actions/upload-artifact@v4
         with:
@@ -31,17 +37,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Install Feature Deps
-        run: pip install pandas numpy pyyaml pyarrow pandas_ta
+          
+      - name: Install Feature Engineering Dependencies
+        run: |
+          pip install pandas numpy pyyaml pyarrow pandas_ta tenacity
+          
       - name: Download Raw Data
         uses: actions/download-artifact@v4
         with:
           name: raw-ohlcv
           path: data/raw/
+          
       - name: Process Features
         run: |
           export PYTHONPATH=$PYTHONPATH:$(pwd)
@@ -56,11 +67,12 @@ jobs:
           proc_dir.mkdir(parents=True, exist_ok=True)
           
           for file in raw_dir.glob("*.parquet"):
+              print(f"Engineering features for {file.name}...")
               df = pd.read_parquet(file)
               processed_df = engineer.calculate_all_features(df)
               processed_df.to_parquet(proc_dir / file.name)
-              print(f"Processed {file.name}")
           PYEOF
+          
       - name: Upload Processed Data
         uses: actions/upload-artifact@v4
         with:
@@ -72,21 +84,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Install Signal Deps
-        run: pip install pandas pyyaml pyarrow
+          
+      - name: Install Signal Engine Dependencies
+        run: |
+          pip install pandas pyyaml pyarrow tenacity
+          
       - name: Download Processed Data
         uses: actions/download-artifact@v4
         with:
           name: processed-features
           path: data/processed/
+          
       - name: Run Signal Engine
         run: |
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           python src/core/signal_generator.py
+          
       - name: Upload Signals
         uses: actions/upload-artifact@v4
         with:
