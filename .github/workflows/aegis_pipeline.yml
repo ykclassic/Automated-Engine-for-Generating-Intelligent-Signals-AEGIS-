@@ -14,7 +14,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
           
       - name: Install Fetcher Dependencies
         run: |
@@ -41,11 +41,12 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
           
       - name: Install Feature Engineering Dependencies
         run: |
-          pip install pandas numpy pyyaml pyarrow pandas_ta tenacity
+          pip install --upgrade pip
+          pip install pandas numpy pyyaml pyarrow pandas-ta tenacity
           
       - name: Download Raw Data
         uses: actions/download-artifact@v4
@@ -88,10 +89,11 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
           
       - name: Install Signal Engine Dependencies
         run: |
+          pip install --upgrade pip
           pip install pandas pyyaml pyarrow tenacity
           
       - name: Download Processed Data
