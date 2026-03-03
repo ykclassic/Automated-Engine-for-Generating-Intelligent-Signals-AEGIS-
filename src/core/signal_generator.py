@@ -1,97 +1,101 @@
-"""
-AEGIS Signal Generation Engine
-Combines indicators and market regime to produce trade signals
-"""
-
-import sys
 import logging
 import pandas as pd
-import numpy as np
 from typing import Dict, List, Optional
 from datetime import datetime
 from pathlib import Path
 
-# Add project root to sys.path for absolute imports
-root_path = Path(__file__).resolve().parent.parent.parent
-if str(root_path) not in sys.path:
-    sys.path.append(str(root_path))
-
+# AEGIS Internal Imports
 try:
     from src.indicators import IndicatorOrchestrator
+    from src.core.risk_management import RiskManager, RiskLevel
 except ImportError:
     from indicators import IndicatorOrchestrator
+    from risk_management import RiskManager, RiskLevel
 
 logger = logging.getLogger(__name__)
 
 class SignalGenerator:
     """
-    Analyzes processed data to generate buy/sell signals
+    AEGIS Signal Engine with Integrated Risk Management
     """
     
-    def __init__(self, config: Optional[Dict] = None):
+    def __init__(self, min_confidence: float = 0.65, risk_level: str = 'moderate'):
         self.orchestrator = IndicatorOrchestrator()
-        self.config = config or {}
-        self.min_confluence = self.config.get('min_confluence', 0.7)
         
-    def generate_signals(self, df: pd.DataFrame, symbol: str) -> List[Dict]:
-        """
-        Processes a single asset's dataframe and returns signals
-        """
-        if df is None or len(df) < 50:
-            return []
-            
-        # 1. Calculate all indicators
-        df = self.orchestrator.calculate_all(df)
+        # Map string from workflow to the Enum in your Risk Module
+        risk_map = {
+            'conservative': RiskLevel.CONSERVATIVE,
+            'moderate': RiskLevel.MODERATE,
+            'aggressive': RiskLevel.AGGRESSIVE
+        }
+        selected_level = risk_map.get(risk_level.lower(), RiskLevel.MODERATE)
         
-        # 2. Get the most recent candle
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        signals = []
-        
-        # Logic: Trend + Momentum + Volatility Confluence
-        # Note: Using .get() to avoid KeyErrors if an indicator fails
-        is_bullish_trend = latest.get('trend_bullish_score', 0) > 0.6
-        is_oversold = latest.get('rsi', 50) < 35
-        is_volume_confirm = latest.get('relative_volume', 1.0) > 1.2
-        
-        # LONG SIGNAL
-        if is_bullish_trend and (is_oversold or latest.get('stoch_k', 50) < 20):
-            entry_price = latest['close']
-            atr = latest.get('atr', entry_price * 0.02)
-            
-            signals.append({
-                'signal_id': f"SIG_{symbol}_{latest.name if isinstance(latest.name, str) else datetime.now().strftime('%H%M%S')}",
-                'timestamp': datetime.now().isoformat(),
-                'symbol': symbol,
-                'direction': 'long',
-                'entry_price': float(entry_price),
-                'stop_loss': float(entry_price - (atr * 2)),
-                'take_profit': float(entry_price + (atr * 4)),
-                'confidence': float(latest.get('trend_bullish_score', 0.5)),
-                'indicators': self.orchestrator.get_indicator_summary(df)
-            })
-            
-        # SHORT SIGNAL
-        elif latest.get('trend_bullish_score', 1.0) < 0.4 and latest.get('rsi', 50) > 65:
-            entry_price = latest['close']
-            atr = latest.get('atr', entry_price * 0.02)
-            
-            signals.append({
-                'signal_id': f"SIG_{symbol}_{datetime.now().strftime('%H%M%S')}",
-                'timestamp': datetime.now().isoformat(),
-                'symbol': symbol,
-                'direction': 'short',
-                'entry_price': float(entry_price),
-                'stop_loss': float(entry_price + (atr * 2)),
-                'take_profit': float(entry_price - (atr * 4)),
-                'confidence': float(1.0 - latest.get('trend_bullish_score', 0.5)),
-                'indicators': self.orchestrator.get_indicator_summary(df)
-            })
-            
-        return signals
+        # Initialize your Risk Manager
+        self.risk_manager = RiskManager(risk_level=selected_level)
+        self.min_confidence = min_confidence
 
-if __name__ == "__main__":
-    # Test block for pipeline
-    logging.basicConfig(level=logging.INFO)
-    print("Signal Generator initialized and ready.")
+    def _calculate_confluence(self, row: pd.Series) -> float:
+        """Weights indicators into a 0.0 - 1.0 score"""
+        score = (
+            row.get('trend_bullish_score', 0.5) * 0.4 +
+            row.get('momentum_score', 0.5) * 0.3 +
+            (1.0 if row.get('volatility_regime') == 'normal' else 0.5) * 0.2 +
+            (1.0 if row.get('relative_volume', 1.0) > 1.5 else 0.5) * 0.1
+        )
+        return round(float(score), 2)
+
+    def generate_signals(self, df: pd.DataFrame, symbol: str, account_balance: float = 10000.0) -> List[Dict]:
+        if df is None or df.empty or len(df) < 50:
+            return []
+
+        # 1. Calculate Indicators
+        df = self.orchestrator.calculate_all(df)
+        latest = df.iloc[-1]
+        
+        # 2. Check for Circuit Breakers
+        can_trade, reason = self.risk_manager.can_trade()
+        if not can_trade:
+            logger.warning(f"Risk Manager Halt: {reason}")
+            return []
+
+        confidence = self._calculate_confluence(latest)
+        direction = "LONG" if confidence >= self.min_confidence else "SHORT" if confidence <= (1 - self.min_confidence) else None
+        
+        if not direction:
+            return []
+
+        # 3. Calculate Position Sizing using your Risk Module logic
+        entry_price = float(latest['close'])
+        atr = latest.get('atr', entry_price * 0.02)
+        
+        # Define SL/TP based on ATR
+        sl = entry_price - (atr * 2) if direction == "LONG" else entry_price + (atr * 2)
+        tp = entry_price + (atr * 4) if direction == "LONG" else entry_price - (atr * 4)
+
+        # Use your RiskManager's Kelly Criterion logic
+        sizing = self.risk_manager.calculate_position_size(
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            stop_loss=sl,
+            take_profit=tp,
+            account_balance=account_balance
+        )
+
+        return [{
+            'signal_id': f"{symbol.replace('/', '')}_{int(datetime.now().timestamp())}",
+            'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+            'symbol': symbol,
+            'direction': direction,
+            'entry_price': entry_price,
+            'confidence': confidence,
+            'risk_metrics': {
+                'position_size_units': round(sizing.size_units, 4),
+                'position_size_pct': f"{sizing.size_pct:.2%}",
+                'leverage': sizing.leverage,
+                'stop_loss': round(sizing.stop_loss_price, 2),
+                'take_profit': round(sizing.take_profit_price, 2),
+                'risk_reward': round(sizing.risk_reward_ratio, 2)
+            },
+            'indicator_snapshot': self.orchestrator.get_indicator_summary(df)
+        }]
