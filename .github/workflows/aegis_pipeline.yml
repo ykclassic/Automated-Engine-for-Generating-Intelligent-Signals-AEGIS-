@@ -1,4 +1,4 @@
- name: AEGIS Alpha Signal Pipeline
+name: AEGIS Alpha Signal Pipeline
 
 on:
   schedule:
