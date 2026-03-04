@@ -1,6 +1,6 @@
 """
 AEGIS Feature Engineering Module
-Standardized to absolute imports for GitHub Actions compatibility.
+Resilient import logic for GitHub Actions Runners.
 """
 
 import pandas as pd
@@ -10,43 +10,57 @@ import sys
 import os
 from pathlib import Path
 
-# Add the project root to sys.path to ensure 'src' is discoverable
-# This handles cases where PYTHONPATH might not propagate to sub-processes
-root_path = Path(__file__).resolve().parent.parent.parent
-if str(root_path) not in sys.path:
-    sys.path.insert(0, str(root_path))
-
-try:
-    # Absolute import is preferred for the AEGIS pipeline
-    from src.indicators.orchestrator import IndicatorOrchestrator
-except ImportError as e:
-    logging.error(f"Failed to import IndicatorOrchestrator: {e}")
-    # Final fallback for unusual runner environments
-    sys.path.append(str(root_path / "src"))
-    from indicators.orchestrator import IndicatorOrchestrator
-
+# Setup logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- Resilient Import Block ---
+current_file = Path(__file__).resolve()
+project_root = current_file.parent.parent.parent # Goes from core -> src -> root
+
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+try:
+    # Attempt absolute import from root
+    from src.indicators.orchestrator import IndicatorOrchestrator
+except (ImportError, ModuleNotFoundError):
+    try:
+        # Attempt direct import from src
+        sys.path.append(str(project_root / "src"))
+        from indicators.orchestrator import IndicatorOrchestrator
+    except (ImportError, ModuleNotFoundError) as e:
+        logger.error(f"CRITICAL: Could not find IndicatorOrchestrator. {e}")
+        raise
+
+# --- Class Definition ---
 class FeatureEngineer:
     def __init__(self):
         self.orchestrator = IndicatorOrchestrator()
 
     def calculate_all_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculates all features. Ensure IndicatorOrchestrator 
+        has a 'calculate_all' method.
+        """
         if df is None or df.empty:
             return pd.DataFrame()
 
-        # 1. Base Technical Indicators
+        # 1. Indicators from Orchestrator
         df = self.orchestrator.calculate_all(df)
 
-        # 2. Add custom AEGIS logic (Volatility & Trend)
-        if 'atr' in df.columns:
-            df['volatility_ratio'] = df['atr'] / df['close']
-        
-        if all(col in df.columns for col in ['ema_50', 'ema_200']):
-            df['trend_bullish'] = (df['ema_50'] > df['ema_200']).astype(int)
+        # 2. Supplemental AEGIS Features
+        if 'close' in df.columns:
+            # Simple Log Returns
+            df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+            
+            # Trend Check (SMA 50/200)
+            if len(df) > 200:
+                df['sma_50'] = df['close'].rolling(window=50).mean()
+                df['sma_200'] = df['close'].rolling(window=200).mean()
+                df['bullish_regime'] = (df['sma_50'] > df['sma_200']).astype(int)
 
-        # Drop NaNs created by lagging indicators (e.g., EMA 200)
         return df.dropna().copy()
 
 if __name__ == "__main__":
-    print("✅ FeatureEngineer module loaded successfully.")
+    print("✅ FeatureEngineer loaded.")
