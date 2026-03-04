@@ -1,95 +1,138 @@
-"""
-AEGIS Main Orchestrator
-Coordinates all components for end-to-end operation.
-Uses Lazy Imports to decouple dependencies for pipeline efficiency.
-"""
+name: AEGIS Alpha Signal Pipeline
 
-import logging
-import json
-import sys
-import os
-from pathlib import Path
-from typing import Dict, List, Optional
-from datetime import datetime
+on:
+  schedule:
+    - cron: '0 * * * *'  # Run every hour
+  workflow_dispatch:      # Allow manual runs
 
-# Setup Root Path
-root = Path(__file__).resolve().parent.parent.parent
-if str(root) not in sys.path:
-    sys.path.insert(0, str(root))
+jobs:
+  fetch-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-logger = logging.getLogger(__name__)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-class AEGISOrchestrator:
-    def __init__(self, risk_level: str = 'moderate', account_balance: float = 10000.0):
-        self.risk_level = risk_level
-        self.account_balance = account_balance
-        logger.info("🛡️ AEGIS Orchestrator initialized")
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pandas ccxt pyyaml pyarrow tenacity
 
-    def calculate_all(self, df):
-        """
-        Proxy for Indicator Orchestration.
-        Imports indicator modules only when needed.
-        """
-        try:
-            from src.indicators.trend import TrendIndicators
-            from src.indicators.momentum import MomentumIndicators
-            
-            # Application of indicator logic
-            # This assumes your indicator classes follow an 'add_X' pattern
-            trend = TrendIndicators()
-            mom = MomentumIndicators()
-            
-            df = trend.add_ema(df, periods=[50, 200])
-            df = mom.add_rsi(df, period=14)
-            return df
-        except ImportError as e:
-            logger.error(f"Failed to load indicator modules: {e}")
-            return df
+      - name: Prepare Package Structure
+        run: |
+          touch __init__.py
+          mkdir -p src/core src/indicators src/utils src/notifications
+          touch src/__init__.py src/core/__init__.py src/indicators/__init__.py
+          touch src/utils/__init__.py src/notifications/__init__.py
 
-    def run_cycle(self) -> Dict:
-        """
-        End-to-end execution. 
-        Imports Data and Risk modules only at runtime.
-        """
-        cycle_start = datetime.now()
-        results = {
-            'timestamp': cycle_start.isoformat(),
-            'status': 'running',
-            'signals_generated': 0,
-            'errors': []
-        }
-        
-        try:
-            # Lazy Imports to avoid dependency requirements in non-fetch jobs
-            from src.core.data_fetcher import DataPipeline
-            from src.core.risk_management import RiskManager
-            from src.core.signal_generator import SignalGenerator
-            from src.notifications.formatter import SignalFormatter
+      - name: Run Data Fetcher
+        run: |
+          export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+          python src/core/data_fetcher.py
 
-            # 1. Fetch Data
-            pipeline = DataPipeline()
-            all_data = pipeline.fetch_all_assets()
-            
-            if not all_data:
-                results['status'] = 'no_data'
-                return results
+      - name: Upload Raw Data
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-ohlcv
+          path: data/raw/
+          retention-days: 1
 
-            # 2. Generate and Filter Signals
-            generator = SignalGenerator(risk_level=self.risk_level)
-            signals = generator.generate_signals(all_data, self.account_balance)
-            results['signals_generated'] = len(signals)
-            
-            results['status'] = 'success'
-            results['duration'] = (datetime.now() - cycle_start).total_seconds()
-            
-        except Exception as e:
-            logger.error(f"Cycle execution failed: {e}")
-            results['status'] = 'error'
-            results['errors'].append(str(e))
-        
-        return results
+  feature-engineering:
+    needs: fetch-data
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    orchestrator = AEGISOrchestrator()
-    print(json.dumps(orchestrator.run_cycle(), indent=2, default=str))
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pandas numpy pyyaml pyarrow pandas-ta tenacity ccxt
+
+      - name: Prepare Package Structure
+        run: |
+          touch __init__.py
+          touch src/__init__.py src/core/__init__.py src/indicators/__init__.py
+
+      - name: Download Raw Data
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-ohlcv
+          path: data/raw/
+
+      - name: Process Features
+        run: |
+          export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+          python << 'PYEOF'
+          import sys
+          import os
+          from pathlib import Path
+          import pandas as pd
+          
+          # Force root into path
+          sys.path.insert(0, os.getcwd())
+          
+          from src.core.feature_engineering import FeatureEngineer
+          
+          engineer = FeatureEngineer()
+          raw_dir = Path("data/raw")
+          proc_dir = Path("data/processed")
+          proc_dir.mkdir(parents=True, exist_ok=True)
+          
+          for file in raw_dir.glob("*.parquet"):
+              print(f"Engineering: {file.name}")
+              df = pd.read_parquet(file)
+              processed_df = engineer.calculate_all_features(df)
+              processed_df.to_parquet(proc_dir / file.name)
+          PYEOF
+
+      - name: Upload Processed Data
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-features
+          path: data/processed/
+          retention-days: 1
+
+  generate-signals:
+    needs: feature-engineering
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pandas pyyaml pyarrow tenacity ccxt
+
+      - name: Download Processed Data
+        uses: actions/download-artifact@v4
+        with:
+          name: processed-features
+          path: data/processed/
+
+      - name: Run Signal Engine
+        run: |
+          export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+          python src/core/signal_generator.py
+
+      - name: Upload Signals
+        uses: actions/upload-artifact@v4
+        with:
+          name: aegis-signals
+          path: signals/
+          retention-days: 7
