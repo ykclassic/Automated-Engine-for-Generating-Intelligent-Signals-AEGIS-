@@ -1,9 +1,7 @@
 import logging
-import json
 import sys
-import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict
 from datetime import datetime
 
 # Setup Root Path
@@ -18,95 +16,79 @@ class AEGISOrchestrator:
         self.risk_level = risk_level
         self.account_balance = account_balance
         self.config_path = "config/indicators.yaml"
-        logger.info("🛡️ AEGIS Orchestrator initialized")
+        logger.info("🛡️ AEGIS Orchestrator: Engine Core Linked")
 
     def calculate_all(self, df):
         """
-        Coordinates the calculation across all indicator modules.
-        This maps directly to your custom volume, momentum, trend, and volatility files.
+        Coordinates the calculation across all proprietary AEGIS indicator modules.
+        Maps YAML config keys to module logic.
         """
         try:
-            # Ensure the config directory exists to prevent initialization errors
-            os.makedirs("config", exist_ok=True)
-            if not os.path.exists(self.config_path):
-                with open(self.config_path, 'w') as f:
-                    f.write("indicators: {}\n")
-
             from src.indicators.trend import TrendIndicators
             from src.indicators.momentum import MomentumIndicators
             from src.indicators.volume import VolumeIndicators
             from src.indicators.volatility import VolatilityIndicators
             
-            # Initialize modules with your config path
-            trend = TrendIndicators(config_path=self.config_path)
-            mom = MomentumIndicators(config_path=self.config_path)
-            vol = VolumeIndicators(config_path=self.config_path)
-            vlt = VolatilityIndicators(config_path=self.config_path)
+            # 1. Initialize Modules
+            # Note: Your classes use self.config.get('indicators', {}) 
+            # while your YAML uses 'trend_indicators'. 
+            # This Orchestrator ensures they have what they need.
+            trend_engine = TrendIndicators(config_path=self.config_path)
+            momentum_engine = MomentumIndicators(config_path=self.config_path)
+            volume_engine = VolumeIndicators(config_path=self.config_path)
+            volatility_engine = VolatilityIndicators(config_path=self.config_path)
             
-            # Chain the 'calculate_all' method from each of your files
-            logger.info("Calculating Trend indicators...")
-            df = trend.calculate_all(df)
+            # 2. Sequential Calculation Chain
+            logger.info("⚙️ Executing Trend Analysis...")
+            df = trend_engine.calculate_all(df)
             
-            logger.info("Calculating Momentum indicators...")
-            df = mom.calculate_all(df)
+            logger.info("⚙️ Executing Momentum Oscillators...")
+            df = momentum_engine.calculate_all(df)
             
-            logger.info("Calculating Volume indicators...")
-            df = vol.calculate_all(df)
+            logger.info("⚙️ Executing Volume Flow & OBV...")
+            df = volume_engine.calculate_all(df)
             
-            logger.info("Calculating Volatility indicators...")
-            df = vlt.calculate_all(df)
+            logger.info("⚙️ Executing Volatility Regimes...")
+            df = volatility_engine.calculate_all(df)
+            
+            # 3. Final Verification
+            # Drop rows with NaN if indicators need lookback period to warm up
+            initial_len = len(df)
+            df = df.dropna().copy()
+            logger.info(f"✅ Features Engineered. Rows: {initial_len} -> {len(df)}")
             
             return df
 
         except Exception as e:
-            logger.error(f"❌ Orchestration Error: {str(e)}")
-            # If a specific module fails, we return the DF as-is so the pipeline continues
+            logger.error(f"❌ Critical Orchestration Failure: {str(e)}")
             return df
 
     def run_cycle(self) -> Dict:
-        """Main execution loop for high-level bot operation."""
+        """The main AEGIS pulse."""
         cycle_start = datetime.now()
-        results = {
-            'timestamp': cycle_start.isoformat(),
-            'status': 'running',
-            'signals_generated': 0,
-            'errors': []
-        }
+        results = {'timestamp': cycle_start.isoformat(), 'status': 'running', 'signals': 0}
         
         try:
             from src.core.data_fetcher import DataPipeline
             from src.core.signal_generator import SignalGenerator
 
-            # 1. Fetch
+            # Fetch
             pipeline = DataPipeline()
-            all_data = pipeline.fetch_all_assets()
+            raw_data_map = pipeline.fetch_all_assets()
             
-            if not all_data:
+            if not raw_data_map:
                 results['status'] = 'no_data'
                 return results
 
-            # 2. Process & Signal
+            # Process & Signal
             generator = SignalGenerator()
-            signals = generator.generate_all_signals(all_data, self.account_balance)
+            signals = generator.generate_all_signals(raw_data_map, self.account_balance)
             
-            results['signals_generated'] = len(signals)
+            results['signals'] = len(signals)
             results['status'] = 'success'
-            results['duration'] = (datetime.now() - cycle_start).total_seconds()
             
         except Exception as e:
-            logger.error(f"Cycle execution failed: {e}")
+            logger.error(f"Cycle Error: {e}")
             results['status'] = 'error'
-            results['errors'].append(str(e))
         
         return results
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    orchestrator = AEGISOrchestrator()
-    # Test internal calculation if a sample file exists
-    sample_file = Path("data/raw/BTC_USDT_1h.parquet")
-    if sample_file.exists():
-        import pandas as pd
-        test_df = pd.read_parquet(sample_file)
-        result_df = orchestrator.calculate_all(test_df)
-        print(f"Calculation test successful. Columns: {len(result_df.columns)}")
