@@ -7,6 +7,7 @@ on:
 
 env:
   PYTHON_VERSION: '3.12'
+  # Ensure this secret is named exactly DISCORD_WEBHOOK in your GitHub Repo Settings
   DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
 jobs:
@@ -76,7 +77,12 @@ jobs:
           proc_dir = Path("data/processed")
           proc_dir.mkdir(parents=True, exist_ok=True)
           
-          for file in raw_dir.glob("*.parquet"):
+          raw_files = list(raw_dir.glob("*.parquet"))
+          if not raw_files:
+              print("⚠️ No raw data files found to process.")
+              sys.exit(0)
+
+          for file in raw_files:
               print(f"Engineering: {file.name}")
               df = pd.read_parquet(file)
               processed_df = engineer.calculate_all_features(df)
@@ -95,7 +101,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       signals_generated: ${{ steps.signal-check.outputs.signals_generated }}
-      signal_count: ${{ steps.signal-check.outputs.signal_count }}
     steps:
       - uses: actions/checkout@v4
 
@@ -128,26 +133,26 @@ jobs:
           import glob
           import yaml
           
+          # Create directory if it doesn't exist to avoid glob errors
+          os.makedirs("signals", exist_ok=True)
           signal_files = glob.glob("signals/*.yaml") + glob.glob("signals/*.json")
+          
+          found = "false"
           if signal_files:
               latest_file = max(signal_files, key=os.path.getctime)
               with open(latest_file, 'r') as f:
-                  data = yaml.safe_load(f)
+                  data = yaml.safe_load(f) if latest_file.endswith(('.yaml', '.yml')) else json.load(f)
                   signals = data.get('signals', [])
-                  count = len(signals)
-              
-              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-                  f.write(f"signals_generated=true\n")
-                  f.write(f"signal_count={count}\n")
-              print(f"✅ Found {count} signals")
-          else:
-              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-                  f.write("signals_generated=false\n")
-                  f.write("signal_count=0\n")
-              print("ℹ️ No signals generated")
+                  if len(signals) > 0:
+                      found = "true"
+                      print(f"✅ Found {len(signals)} signals in {latest_file}")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"signals_generated={found}\n")
           PYEOF
 
       - name: Upload Signals
+        if: steps.signal-check.outputs.signals_generated == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: aegis-signals
@@ -157,6 +162,7 @@ jobs:
   discord-alert:
     needs: generate-signals
     runs-on: ubuntu-latest
+    # This condition ensures the job only runs if signals were actually found
     if: needs.generate-signals.outputs.signals_generated == 'true'
     steps:
       - uses: actions/checkout@v4
@@ -188,78 +194,60 @@ jobs:
           import yaml
           from datetime import datetime
           
-          webhook_url = os.environ.get('DISCORD_WEBHOOK')
+          webhook_url = os.getenv('DISCORD_WEBHOOK')
           if not webhook_url:
-              print("⚠️ No Discord webhook configured")
+              print("❌ ERROR: DISCORD_WEBHOOK secret is empty or not found.")
+              sys.exit(1)
+          
+          signal_files = glob.glob('signals/*.yaml') + glob.glob('signals/*.json')
+          if not signal_files:
+              print("❌ ERROR: Artifact downloaded but no signal files found in directory.")
+              sys.exit(1)
+          
+          latest_file = max(signal_files, key=os.path.getctime)
+          print(f"📡 Processing alerts from: {latest_file}")
+          
+          with open(latest_file, 'r') as f:
+              data = yaml.safe_load(f) if latest_file.endswith(('.yaml', '.yml')) else json.load(f)
+          
+          signals = data.get('signals', [])
+          if not signals:
+              print("ℹ️ Signal file was empty.")
               sys.exit(0)
           
-          try:
-              signal_files = glob.glob('signals/*.yaml') + glob.glob('signals/*.json')
-              if not signal_files:
-                  print("ℹ️ No signal files found")
-                  sys.exit(0)
+          embeds = []
+          colors = {'buy': 0x00FFA3, 'sell': 0xFF0055, 'hold': 0x7000FF}
+          
+          # Process top 5 signals
+          for signal in signals[:5]:
+              sig_type = signal.get('signal_type', 'hold').lower()
+              symbol = signal.get('symbol', 'Unknown')
               
-              latest_file = max(signal_files, key=os.path.getctime)
-              print(f"📡 Sending alerts from: {latest_file}")
+              fields = [
+                  {"name": "🎯 Entry", "value": f"`${signal.get('entry_price', 0):,.4f}`", "inline": True},
+                  {"name": "🛑 Stop Loss", "value": f"`${signal.get('stop_loss', 0):,.4f}`", "inline": True},
+                  {"name": "🎯 Take Profit", "value": f"`${signal.get('take_profit', 0):,.4f}`", "inline": True},
+                  {"name": "📊 Confidence", "value": f"{signal.get('confidence', 0):.1%}", "inline": True},
+                  {"name": "⚖️ R/R Ratio", "value": f"`{signal.get('risk_reward_ratio', 0)}:1`", "inline": True},
+                  {"name": "⏰ Timeframe", "value": f"`{signal.get('timeframe', '1h')}`", "inline": True}
+              ]
               
-              with open(latest_file, 'r') as f:
-                  if latest_file.endswith(('.yaml', '.yml')):
-                      data = yaml.safe_load(f)
-                  else:
-                      data = json.load(f)
-              
-              signals = data.get('signals', [])
-              if not signals:
-                  print("ℹ️ No signals in file")
-                  sys.exit(0)
-              
-              embeds = []
-              colors = {'buy': 0x00ff00, 'sell': 0xff0000, 'hold': 0xffff00}
-              
-              for signal in signals[:5]:
-                  sig_type = signal.get('signal_type', 'hold').lower()
-                  symbol = signal.get('symbol', 'Unknown')
-                  confidence = signal.get('confidence', 0)
-                  entry = signal.get('entry_price', 0)
-                  stop = signal.get('stop_loss', 0)
-                  target = signal.get('take_profit', 0)
-                  rr = signal.get('risk_reward_ratio', 0)
-                  timeframe = signal.get('timeframe', '1h')
-                  
-                  fields = [
-                      {"name": "🎯 Entry", "value": f"${entry:,.4f}", "inline": True},
-                      {"name": "🛑 Stop Loss", "value": f"${stop:,.4f}", "inline": True},
-                      {"name": "🎯 Take Profit", "value": f"${target:,.4f}", "inline": True},
-                      {"name": "📊 Confidence", "value": f"{confidence:.1%}", "inline": True},
-                      {"name": "⚖️ R/R Ratio", "value": f"1:{rr:.1f}" if rr else "N/A", "inline": True},
-                      {"name": "⏰ Timeframe", "value": timeframe, "inline": True}
-                  ]
-                  
-                  metadata = signal.get('metadata', {})
-                  if metadata:
-                      meta_text = "\n".join([f"{k.upper()}: {v}" for k, v in metadata.items()])
-                      fields.append({"name": "📈 Indicators", "value": meta_text, "inline": False})
-                  
-                  embeds.append({
-                      "title": f"🚀 {symbol} {sig_type.upper()} SIGNAL",
-                      "color": colors.get(sig_type, 0x808080),
-                      "fields": fields,
-                      "timestamp": signal.get('timestamp', datetime.now().isoformat()),
-                      "footer": {"text": "AEGIS Alpha Signal Engine"}
-                  })
-              
-              payload = {
-                  "content": f"📡 **AEGIS Alpha Alert** — {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}",
-                  "embeds": embeds
-              }
-              
-              response = requests.post(webhook_url, json=payload, timeout=10)
-              response.raise_for_status()
-              print(f"✅ Successfully sent {len(embeds)} alerts")
-              
-          except Exception as e:
-              print(f"❌ Discord alert failed: {e}")
-              sys.exit(0)
+              embeds.append({
+                  "title": f"🚀 {symbol} {sig_type.upper()} SIGNAL",
+                  "color": colors.get(sig_type, 0x808080),
+                  "fields": fields,
+                  "timestamp": datetime.utcnow().isoformat(),
+                  "footer": {"text": "AEGIS Intelligence Suite"}
+              })
+          
+          payload = {
+              "content": f"📡 **AEGIS Alpha Alert** — {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}",
+              "embeds": embeds
+          }
+          
+          resp = requests.post(webhook_url, json=payload, timeout=10)
+          resp.raise_for_status()
+          print(f"✅ Alert sent successfully.")
           PYEOF
 
   pipeline-summary:
@@ -270,7 +258,7 @@ jobs:
       - name: Pipeline Summary
         run: |
           echo "========================================"
-          echo "🎯 AEGIS Pipeline Complete"
+          echo "🎯 AEGIS Pipeline Status"
           echo "========================================"
           echo "Fetch Data: ${{ needs.fetch-data.result }}"
           echo "Feature Engineering: ${{ needs.feature-engineering.result }}"
