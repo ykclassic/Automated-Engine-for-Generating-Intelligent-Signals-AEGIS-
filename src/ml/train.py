@@ -25,7 +25,6 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-
 class TrainingPipeline:
     """
     End-to-end training pipeline
