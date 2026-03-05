@@ -19,19 +19,18 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install Dependencies
-        run: pip install pandas ccxt pyyaml pyarrow tenacity requests
+        run: pip install pandas ccxt pyyaml pyarrow tenacity requests zstandard
       - name: Run Data Fetcher
         run: |
           mkdir -p data/raw
           export PYTHONPATH="${PYTHONPATH}:$(pwd)"
-          python src/core/data_fetcher.py
+          python src/core/data_fetcher.py # This now calls update_all_data()
       - name: Upload Raw Data
         uses: actions/upload-artifact@v4
         with:
           name: raw-ohlcv
           path: data/raw/
-          if-no-files-found: error # FAIL HERE if data-fetcher didn't work
-          retention-days: 1
+          if-no-files-found: error
 
   feature-engineering:
     needs: fetch-data
@@ -43,24 +42,39 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install Dependencies
-        run: pip install pandas numpy pyyaml pyarrow pandas-ta tenacity ccxt requests
+        run: pip install pandas numpy pyyaml pyarrow pandas-ta tenacity ccxt requests zstandard
       - name: Download Raw Data
         uses: actions/download-artifact@v4
         with:
           name: raw-ohlcv
           path: data/raw/
-      - name: Process Features
+      - name: Run Feature Engineering
         run: |
           mkdir -p data/processed
           export PYTHONPATH="${PYTHONPATH}:$(pwd)"
-          python src/core/feature_engineering.py
+          # We use a custom runner block to bridge your class and the workflow
+          python << 'PYEOF'
+          import os, sys
+          from pathlib import Path
+          import pandas as pd
+          from src.core.feature_engineering import FeatureEngineer
+          
+          engineer = FeatureEngineer()
+          raw_dir = Path("data/raw")
+          proc_dir = Path("data/processed")
+          
+          for file in raw_dir.glob("*.parquet"):
+              print(f"Engineering: {file.name}")
+              df = pd.read_parquet(file)
+              processed_df = engineer.calculate_all_features(df)
+              processed_df.to_parquet(proc_dir / file.name)
+          PYEOF
       - name: Upload Processed Data
         uses: actions/upload-artifact@v4
         with:
           name: processed-features
           path: data/processed/
-          if-no-files-found: error # FAIL HERE if feature-engineering didn't work
-          retention-days: 1
+          if-no-files-found: error
 
   generate-signals:
     needs: feature-engineering
@@ -72,7 +86,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install Dependencies
-        run: pip install pandas pyyaml pyarrow tenacity ccxt requests
+        run: pip install pandas pyyaml pyarrow tenacity ccxt requests zstandard
       - name: Download Processed Data
         uses: actions/download-artifact@v4
         with:
@@ -82,19 +96,18 @@ jobs:
         run: |
           mkdir -p signals
           export PYTHONPATH="${PYTHONPATH}:$(pwd)"
-          python src/core/signal_generator.py
+          python src/core/signal_generator.py # Calls process_all_signals()
       - name: Upload Signals
         uses: actions/upload-artifact@v4
         with:
           name: aegis-signals
           path: signals/
-          if-no-files-found: warn # Don't crash here, we want the alert to run even with no signals
-          retention-days: 7
+          if-no-files-found: warn
 
   discord-alert:
     needs: generate-signals
     runs-on: ubuntu-latest
-    if: always() # Run even if previous jobs failed (so you get the "forging profits" message)
+    if: always() # IMPORTANT: Always run this
     steps:
       - uses: actions/checkout@v4
       - name: Setup Python
@@ -103,55 +116,40 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install Dependencies
         run: pip install requests pyyaml
-      
-      # Try to download signals, but continue if they don't exist
       - name: Download Signals
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           name: aegis-signals
           path: signals/
-
-      - name: Send Discord Alert
+      - name: Send Alert
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           python << 'PYEOF'
-          import os
-          import sys
-          import glob
-          import json
-          import requests
-          import yaml
+          import os, glob, json, requests, yaml
           from datetime import datetime
           
           webhook_url = os.getenv('DISCORD_WEBHOOK')
-          if not webhook_url:
-              print("⚠️ Webhook missing")
-              sys.exit(0)
-          
+          signal_files = glob.glob('signals/*.json')
           signals = []
-          signal_files = glob.glob('signals/*.yaml') + glob.glob('signals/*.json')
+          
           if signal_files:
-              latest_file = max(signal_files, key=os.path.getctime)
-              with open(latest_file, 'r') as f:
-                  data = yaml.safe_load(f) if latest_file.endswith(('.yaml', '.yml')) else json.load(f)
-                  signals = data.get('signals', [])
+              with open(max(signal_files, key=os.path.getctime), 'r') as f:
+                  signals = json.load(f)
 
           if not signals:
               content = "🛡️ **AEGIS System Update**"
-              embeds = [{
-                  "title": "Market Monitoring Active",
-                  "description": "AEGIS is still forging profits trade for you",
-                  "color": 0x7000FF,
-                  "timestamp": datetime.utcnow().isoformat()
-              }]
+              embeds = [{"title": "Monitoring Mode", "description": "AEGIS is still forging profits trade for you", "color": 0x7000FF}]
           else:
-              content = f"📡 **AEGIS Alpha Alert** — {len(signals)} Signals Found"
+              content = "🚀 **AEGIS Signal Detected**"
               embeds = []
-              # (rest of signal logic)
-              for sig in signals[:3]:
-                  embeds.append({"title": f"🚀 {sig.get('symbol')} Signal", "color": 0x00FFA3})
+              for s in signals[:3]:
+                  embeds.append({
+                      "title": f"{s['symbol']} {s['direction']}",
+                      "description": f"Entry: ${s['entry_price']}\nConfidence: {s['confidence']:.0%}",
+                      "color": 0x00FFA3
+                  })
 
           requests.post(webhook_url, json={"content": content, "embeds": embeds})
           PYEOF
