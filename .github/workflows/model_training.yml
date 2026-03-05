@@ -64,7 +64,7 @@ jobs:
               print(f'📥 Deep Fetching {symbol} for training...')
               try:
                   # Use the fetch_ohlcv method from your DataFetcher class
-                  fetcher.fetch_ohlcv(symbol, timeframe='1h', limit=2000)
+                  fetcher.fetch_ohlcv(symbol, timeframe='1h', limit=5000)
               except Exception as e:
                   print(f'Error fetching {symbol}: {e}')
           "
