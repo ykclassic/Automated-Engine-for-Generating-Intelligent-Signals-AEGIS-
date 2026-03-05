@@ -42,7 +42,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install Dependencies
-        run: pip install pandas numpy pyyaml pyarrow pandas-ta tenacity ccxt requests zstandard
+        run: pip install pandas numpy pyyaml pyarrow pandas-ta tenacity ccxt==4.2.25 requests zstandard
       - name: Download Raw Data
         uses: actions/download-artifact@v4
         with:
