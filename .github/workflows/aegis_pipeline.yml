@@ -1,9 +1,13 @@
-name: AEGIS Alpha Signal Pipeline
+ name: AEGIS Alpha Signal Pipeline
 
 on:
   schedule:
     - cron: '0 * * * *'  # Run every hour
   workflow_dispatch:      # Allow manual runs
+
+env:
+  PYTHON_VERSION: '3.12'
+  DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
 jobs:
   fetch-data:
@@ -13,11 +17,11 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ env.PYTHON_VERSION }}
       - name: Install Dependencies
         run: |
           pip install --upgrade pip
-          pip install pandas ccxt pyyaml pyarrow tenacity
+          pip install pandas ccxt pyyaml pyarrow tenacity requests
       - name: Run Data Fetcher
         run: |
           export PYTHONPATH="${PYTHONPATH}:$(pwd)"
@@ -37,11 +41,11 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ env.PYTHON_VERSION }}
       - name: Install Dependencies
         run: |
           pip install --upgrade pip
-          pip install pandas numpy pyyaml pyarrow pandas-ta tenacity ccxt
+          pip install pandas numpy pyyaml pyarrow pandas-ta tenacity ccxt requests
       - name: Initialize Package
         run: |
           touch __init__.py
@@ -59,15 +63,12 @@ jobs:
           import os
           from pathlib import Path
           import pandas as pd
-          
           sys.path.insert(0, os.getcwd())
           from src.core.feature_engineering import FeatureEngineer
-          
           engineer = FeatureEngineer()
           raw_dir = Path("data/raw")
           proc_dir = Path("data/processed")
           proc_dir.mkdir(parents=True, exist_ok=True)
-          
           for file in raw_dir.glob("*.parquet"):
               print(f"Engineering: {file.name}")
               df = pd.read_parquet(file)
@@ -84,16 +85,19 @@ jobs:
   generate-signals:
     needs: feature-engineering
     runs-on: ubuntu-latest
+    outputs:
+      signals_generated: ${{ steps.signal-check.outputs.signals_generated }}
+      signal_count: ${{ steps.signal-check.outputs.signal_count }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ env.PYTHON_VERSION }}
       - name: Install Dependencies
         run: |
           pip install --upgrade pip
-          pip install pandas pyyaml pyarrow tenacity ccxt
+          pip install pandas pyyaml pyarrow tenacity ccxt requests
       - name: Download Processed Data
         uses: actions/download-artifact@v4
         with:
@@ -103,9 +107,167 @@ jobs:
         run: |
           export PYTHONPATH="${PYTHONPATH}:$(pwd)"
           python src/core/signal_generator.py
+      - name: Check for Signals
+        id: signal-check
+        run: |
+          python << 'PYEOF'
+          import os
+          import glob
+          signal_files = glob.glob("signals/*.yaml") + glob.glob("signals/*.json")
+          if signal_files:
+              import yaml
+              latest_file = max(signal_files, key=os.path.getctime)
+              with open(latest_file, 'r') as f:
+                  data = yaml.safe_load(f)
+                  signals = data.get('signals', [])
+                  count = len(signals)
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                  f.write(f"signals_generated=true\n")
+                  f.write(f"signal_count={count}\n")
+              print(f"✅ Found {count} signals")
+          else:
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                  f.write("signals_generated=false\n")
+                  f.write("signal_count=0\n")
+              print("ℹ️ No signals generated")
+          PYEOF
       - name: Upload Signals
         uses: actions/upload-artifact@v4
         with:
           name: aegis-signals
           path: signals/
           retention-days: 7
+
+  discord-alert:
+    needs: generate-signals
+    runs-on: ubuntu-latest
+    if: needs.generate-signals.outputs.signals_generated == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Dependencies
+        run: pip install requests pyyaml
+      - name: Download Signals
+        uses: actions/download-artifact@v4
+        with:
+          name: aegis-signals
+          path: signals/
+      - name: Send Discord Alert
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          python << 'PYEOF'
+          import os
+          import sys
+          import glob
+          import json
+          from datetime import datetime
+          
+          webhook_url = os.environ.get('DISCORD_WEBHOOK')
+          if not webhook_url:
+              print("⚠️ No Discord webhook configured")
+              sys.exit(0)
+          
+          try:
+              import requests
+              import yaml
+              
+              signal_files = glob.glob('signals/*.yaml') + glob.glob('signals/*.json')
+              if not signal_files:
+                  print("ℹ️ No signal files found")
+                  sys.exit(0)
+              
+              latest_file = max(signal_files, key=os.path.getctime)
+              print(f"📡 Sending alerts from: {latest_file}")
+              
+              with open(latest_file, 'r') as f:
+                  data = yaml.safe_load(f) if latest_file.endswith(('.yaml', '.yml')) else json.load(f)
+              
+              signals = data.get('signals', [])
+              if not signals:
+                  print("ℹ️ No signals in file")
+                  sys.exit(0)
+              
+              # Build rich embeds for top 5 signals
+              embeds = []
+              colors = {'buy': 0x00ff00, 'sell': 0xff0000, 'hold': 0xffff00}
+              
+              for signal in signals[:5]:
+                  sig_type = signal.get('signal_type', 'hold').lower()
+                  symbol = signal.get('symbol', 'Unknown')
+                  confidence = signal.get('confidence', 0)
+                  entry = signal.get('entry_price', 0)
+                  stop = signal.get('stop_loss', 0)
+                  target = signal.get('take_profit', 0)
+                  rr = signal.get('risk_reward_ratio', 0)
+                  timeframe = signal.get('timeframe', '1h')
+                  
+                  fields = [
+                      {"name": "🎯 Entry", "value": f"${entry:,.4f}", "inline": True},
+                      {"name": "🛑 Stop Loss", "value": f"${stop:,.4f}", "inline": True},
+                      {"name": "🎯 Take Profit", "value": f"${target:,.4f}", "inline": True},
+                      {"name": "📊 Confidence", "value": f"{confidence:.1%}", "inline": True},
+                      {"name": "⚖️ R/R Ratio", "value": f"1:{rr:.1f}" if rr else "N/A", "inline": True},
+                      {"name": "⏰ Timeframe", "value": timeframe, "inline": True}
+                  ]
+                  
+                  # Add metadata if available
+                  metadata = signal.get('metadata', {})
+                  if metadata:
+                      meta_text = ""
+                      if 'rsi' in metadata:
+                          meta_text += f"RSI: {metadata['rsi']:.1f}\n"
+                      if 'volume_ratio' in metadata:
+                          meta_text += f"Vol Ratio: {metadata['volume_ratio']:.2f}x\n"
+                      if meta_text:
+                          fields.append({"name": "📈 Indicators", "value": meta_text.strip(), "inline": False})
+                  
+                  embed = {
+                      "title": f"🚀 {symbol} {sig_type.upper()} SIGNAL",
+                      "color": colors.get(sig_type, 0x808080),
+                      "fields": fields,
+                      "timestamp": signal.get('timestamp', datetime.now().isoformat()),
+                      "footer": {"text": "AEGIS Alpha Signal Engine"}
+                  }
+                  embeds.append(embed)
+              
+              # Send webhook with rich embeds
+              payload = {
+                  "content": f"📡 **AEGIS Alpha Alert** — {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}\nGenerated {len(signals)} high-confidence trading signals.",
+                  "embeds": embeds
+              }
+              
+              response = requests.post(
+                  webhook_url,
+                  json=payload,
+                  headers={'Content-Type': 'application/json'},
+                  timeout=10
+              )
+              response.raise_for_status()
+              print(f"✅ Successfully sent {len(embeds)} signal alerts to Discord")
+              
+          except Exception as e:
+              print(f"❌ Discord alert failed: {e}")
+              import traceback
+              traceback.print_exc()
+              sys.exit(0)
+          PYEOF
+
+  pipeline-summary:
+    needs: [fetch-data, feature-engineering, generate-signals, discord-alert]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Pipeline Summary
+        run: |
+          echo "========================================"
+          echo "🎯 AEGIS Pipeline Complete"
+          echo "========================================"
+          echo "Fetch Data: ${{ needs.fetch-data.result }}"
+          echo "Feature Engineering: ${{ needs.feature-engineering.result }}"
+          echo "Signal Generation: ${{ needs.generate-signals.result }}"
+          echo "Discord Alert: ${{ needs.discord-alert.result }}"
+          echo "========================================"
