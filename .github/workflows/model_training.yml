@@ -2,7 +2,8 @@ name: AEGIS Model Training
 
 on:
   schedule:
-    - cron: '0 0 * * 0' # Retrain weekly on Sundays
+    # Retrain weekly on Sundays at 00:00 UTC
+    - cron: '0 0 * * 0'
   workflow_dispatch:
     inputs:
       optimize_hyperparams:
@@ -31,7 +32,7 @@ jobs:
           pip install pandas numpy ccxt pyyaml joblib lightgbm xgboost scikit-learn requests pyarrow
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Download Historical Data (All 10 Pairs)
+      - name: Download Historical Data (Global 10-Asset Suite)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
@@ -39,22 +40,40 @@ jobs:
           import os, yaml, sys
           from src.core.data_fetcher import DataFetcher, ExchangeManager
           
+          # Initialize Core Data Engine
           manager = ExchangeManager()
           fetcher = DataFetcher(manager, data_dir="data")
           
-          with open('config/assets.yaml', 'r') as f:
-              assets_cfg = yaml.safe_load(f)
+          # Load Assets with "Flexible Root" logic to avoid KeyError
+          try:
+              with open('config/assets.yaml', 'r') as f:
+                  assets_cfg = yaml.safe_load(f)
+          except Exception as e:
+              print(f"❌ Critical: Could not read config/assets.yaml: {e}")
+              sys.exit(1)
           
-          # Iterate through ALL categories: majors, large_cap, mid_cap
-          for category in ['majors', 'large_cap', 'mid_cap']:
-              targets = assets_cfg['assets'].get(category, [])
-              for asset in targets:
-                  symbol = asset['symbol']
-                  print(f"📥 Deep Fetching {symbol} (5000 periods)...")
-                  try:
-                      fetcher.fetch_ohlcv(symbol, timeframe='1h', limit=5000)
-                  except Exception as e:
-                      print(f"⚠️ Failed to fetch {symbol}: {e}")
+          # Check if assets are nested under 'assets' key or at top level
+          data_root = assets_cfg.get('assets', assets_cfg)
+          categories = ['majors', 'large_cap', 'mid_cap']
+          found_count = 0
+
+          for cat in categories:
+              pairs = data_root.get(cat, [])
+              for asset in pairs:
+                  symbol = asset.get('symbol')
+                  if symbol:
+                      print(f"📥 Deep Fetching {symbol} (5000 bars)...")
+                      try:
+                          # Using 5000 to provide 7 months of H1 data for ML
+                          fetcher.fetch_ohlcv(symbol, timeframe='1h', limit=5000)
+                          found_count += 1
+                      except Exception as e:
+                          print(f"⚠️ Failed to fetch {symbol}: {e}")
+          
+          if found_count == 0:
+              print("❌ Error: No valid assets found. Check YAML structure.")
+              sys.exit(1)
+          print(f"✅ Successfully prepared data for {found_count} assets.")
           PYEOF
 
       - name: Execute Multi-Asset ML Training
@@ -69,19 +88,24 @@ jobs:
           raw_dir = Path("data/raw")
           all_dfs = []
           
+          # Load and label all fetched parquet files
           for file in raw_dir.glob("*.parquet"):
-              df = pd.read_parquet(file)
-              # Add symbol column from filename for the model to differentiate
-              df['symbol'] = file.stem.split('_')[0]
-              all_dfs.append(df)
+              try:
+                  df = pd.read_parquet(file)
+                  if len(df) > 0:
+                      df['symbol'] = file.stem.split('_')[0]
+                      all_dfs.append(df)
+              except Exception as e:
+                  print(f"Could not load {file}: {e}")
           
           if not all_dfs:
-              print("❌ No data found."); sys.exit(1)
+              print("❌ No training data found in data/raw."); sys.exit(1)
               
           combined = pd.concat(all_dfs).sort_index()
-          print(f"✅ Training on Pooled Dataset: {len(combined)} total samples across 10 pairs.")
+          print(f"🚀 Training Global Brain on {len(combined)} total samples.")
 
           trainer = TrainingPipeline()
+          # This saves .joblib files to data/models/
           results = trainer.run_full_training(combined, model_types=['lightgbm', 'xgboost', 'ensemble'])
           
           os.makedirs('data/processed', exist_ok=True)
@@ -89,19 +113,25 @@ jobs:
               json.dump(results, f, indent=2, default=str)
           PYEOF
 
-      - name: Commit to data-storage
+      - name: Update data-storage Branch
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
+          
+          # Fetch and switch to the data-storage branch
           git fetch origin data-storage || true
-          git checkout data-storage 2>/dev/null || git checkout -b data-storage
+          git checkout data-storage 2>/dev/null || git checkout --orphan data-storage
+          
           mkdir -p models
+          # Copy models and metadata from the runner's workspace
           cp data/models/* models/ 2>/dev/null || true
+          
           git add models/
-          git commit -m "🤖 Global Intelligence Update: $(date -u +'%Y-%m-%d')" || echo "No changes"
+          git commit -m "🤖 Global Intelligence Update: $(date -u +'%Y-%m-%d %H:%M')" || echo "No changes"
           git push origin data-storage
 
       - name: Discord Notification
+        if: always()
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           REPO_URL: "https://github.com/${{ github.repository }}/tree/data-storage/models"
@@ -110,21 +140,36 @@ jobs:
           import json, os, requests
           from datetime import datetime
           
-          with open('data/processed/training_results.json') as f:
-              results = json.load(f)
+          try:
+              with open('data/processed/training_results.json') as f:
+                  results = json.load(f)
+          except:
+              results = {}
 
           fields = []
           for model, res in results.items():
               if res.get('status') == 'success':
                   m = res.get('metrics', {})
-                  fields.append({'name': f"✅ {model.upper()}", 'value': f"F1: `{m.get('f1_macro', 0):.3f}`", 'inline': True})
+                  stats = f"🎯 F1: `{m.get('f1_macro', 0):.3f}` | Acc: `{m.get('accuracy', 0):.1%}`"
+                  fields.append({'name': f"✅ {model.upper()}", 'value': stats, 'inline': False})
+              else:
+                  fields.append({'name': f"❌ {model.upper()}", 'value': f"Failed: {res.get('error', 'Error')}", 'inline': False})
           
           embed = {
-              'title': '🤖 AEGIS Global Brain Retrained',
-              'description': f"Trained on 10 pairs. [Download Models]({os.getenv('REPO_URL')})",
+              'title': '🤖 AEGIS Model Retraining Complete',
+              'description': f"Global training on 10 pairs finished.\n[📂 **Download Latest Models**]({os.getenv('REPO_URL')})",
               'color': 0x00FFA3,
               'fields': fields,
               'timestamp': datetime.utcnow().isoformat()
           }
           requests.post(os.getenv('DISCORD_WEBHOOK'), json={'embeds': [embed]})
           PYEOF
+
+      - name: Report Failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          curl -H "Content-Type: application/json" \
+            -d '{"embeds": [{"title": "❌ AEGIS Training Failed", "color": 15158332, "description": "Check logs for KeyError or Data Drought errors."}]}' \
+            $DISCORD_WEBHOOK
