@@ -147,41 +147,49 @@ jobs:
       - name: Report results to Discord
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          REPO_URL: "https://github.com/${{ github.repository }}/tree/data-storage/models"
         run: |
-          python -c "
-          import json
-          import os
-          import requests
+          python << 'PYEOF'
+          import json, os, requests
           from datetime import datetime
           
+          # 1. Load Results
           try:
               with open('data/processed/training_results.json') as f:
                   results = json.load(f)
-          except:
+          except Exception:
               results = {}
-          
+
           webhook = os.environ.get('DISCORD_WEBHOOK')
+          repo_url = os.environ.get('REPO_URL')
+          
           if not webhook:
+              print("Webhook missing, skipping notification.")
               exit(0)
           
+          # 2. Build Fields for each model
           fields = []
-          for model, result in results.items():
-              if result.get('status') == 'success':
-                  metrics = result.get('metrics', {})
-                  value = f\\\"F1: {metrics.get('f1_macro', 0):.3f}, Acc: {metrics.get('accuracy', 0):.3f}\\\"
-                  fields.append({'name': model, 'value': value, 'inline': True})
+          for model, res in results.items():
+              if res.get('status') == 'success':
+                  m = res.get('metrics', {})
+                  stats = f"🎯 F1: `{m.get('f1_macro', 0):.3f}`\n📈 Acc: `{m.get('accuracy', 0):.2%}`"
+                  fields.append({'name': f"✅ {model.upper()}", 'value': stats, 'inline': True})
               else:
-                  error = result.get('error', 'Unknown error')
-                  fields.append({'name': model, 'value': f'Failed: {error}', 'inline': True})
+                  err = res.get('error', 'Unknown Error')
+                  fields.append({'name': f"❌ {model.upper()}", 'value': f"Error: {err}", 'inline': True})
           
+          # 3. Construct Embed
           embed = {
-              'title': '🤖 Model Training Complete',
-              'color': 3447003,
+              'title': '🤖 AEGIS Model Retraining Complete',
+              'description': f"New intelligence models have been forged and pushed to the `data-storage` branch.\n\n[📦 **Download New Models**]({repo_url})",
+              'color': 0x00FFA3, # Matrix Green
               'fields': fields,
+              'footer': {'text': f"Runner ID: {os.getenv('GITHUB_RUN_ID')}"},
               'timestamp': datetime.utcnow().isoformat()
           }
           
           requests.post(webhook, json={'embeds': [embed]})
+          PYEOF
           "
       
       - name: Report failure
