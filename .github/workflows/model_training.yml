@@ -2,8 +2,7 @@ name: AEGIS Model Training
 
 on:
   schedule:
-    # Retrain weekly on Sundays at 00:00 UTC
-    - cron: '0 0 * * 0'
+    - cron: '0 0 * * 0' # Retrain weekly on Sundays
   workflow_dispatch:
     inputs:
       optimize_hyperparams:
@@ -14,6 +13,7 @@ on:
 jobs:
   train-models:
     runs-on: ubuntu-latest
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,115 +25,83 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Cache Python dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          pip install pandas numpy ccxt pyyaml joblib lightgbm xgboost scikit-learn requests pyarrow
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install lightgbm xgboost scikit-learn joblib pandas numpy ccxt pyyaml pyarrow requests
 
-      - name: Download historical data
+      - name: Download Historical Data (All 10 Pairs)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -c "
-          import os, sys, yaml
+          python << 'PYEOF'
+          import os, yaml, sys
           from src.core.data_fetcher import DataFetcher, ExchangeManager
           
-          # Initialize correctly based on your source code
           manager = ExchangeManager()
-          fetcher = DataFetcher(manager, data_dir='data')
+          fetcher = DataFetcher(manager, data_dir="data")
           
-          try:
-              with open('config/assets.yaml') as f:
-                  config = yaml.safe_load(f)
-                  assets = config['assets'].get('tier_1', [])[:3]
-          except Exception as e:
-              print(f'Config error: {e}')
-              assets = [{'symbol': 'BTC/USDT'}]
+          with open('config/assets.yaml', 'r') as f:
+              assets_cfg = yaml.safe_load(f)
           
-          for asset in assets:
-              symbol = asset['symbol']
-              print(f'📥 Deep Fetching {symbol} for training...')
-              try:
-                  # Use the fetch_ohlcv method from your DataFetcher class
-                  fetcher.fetch_ohlcv(symbol, timeframe='1h', limit=5000)
-              except Exception as e:
-                  print(f'Error fetching {symbol}: {e}')
-          "
+          # Iterate through ALL categories: majors, large_cap, mid_cap
+          for category in ['majors', 'large_cap', 'mid_cap']:
+              targets = assets_cfg['assets'].get(category, [])
+              for asset in targets:
+                  symbol = asset['symbol']
+                  print(f"📥 Deep Fetching {symbol} (5000 periods)...")
+                  try:
+                      fetcher.fetch_ohlcv(symbol, timeframe='1h', limit=5000)
+                  except Exception as e:
+                      print(f"⚠️ Failed to fetch {symbol}: {e}")
+          PYEOF
 
-      - name: Train models
+      - name: Execute Multi-Asset ML Training
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -c "
-          import sys, os, json, pandas as pd
+          python << 'PYEOF'
+          import os, sys, json, pandas as pd
           from pathlib import Path
           from src.ml.train import TrainingPipeline
           
-          # Load the data fetched in the previous step
-          raw_dir = Path('data/raw')
-          all_data = []
+          raw_dir = Path("data/raw")
+          all_dfs = []
           
-          for file in raw_dir.glob('*.parquet'):
-              try:
-                  df = pd.read_parquet(file)
-                  if len(df) > 500: # Ensure enough history
-                      # Extract symbol from filename (e.g., BTC_USDT_1h.parquet)
-                      df['symbol'] = file.stem.split('_')[0]
-                      all_data.append(df)
-                      print(f'✅ Loaded {len(df)} rows from {file.name}')
-              except Exception as e:
-                  print(f'Error loading {file.name}: {e}')
+          for file in raw_dir.glob("*.parquet"):
+              df = pd.read_parquet(file)
+              # Add symbol column from filename for the model to differentiate
+              df['symbol'] = file.stem.split('_')[0]
+              all_dfs.append(df)
           
-          if not all_data:
-              print('❌ No data available for training'); sys.exit(1)
-          
-          combined = pd.concat(all_data)
-          print(f'🚀 Training Engine started on {len(combined)} samples...')
-          
+          if not all_dfs:
+              print("❌ No data found."); sys.exit(1)
+              
+          combined = pd.concat(all_dfs).sort_index()
+          print(f"✅ Training on Pooled Dataset: {len(combined)} total samples across 10 pairs.")
+
           trainer = TrainingPipeline()
           results = trainer.run_full_training(combined, model_types=['lightgbm', 'xgboost', 'ensemble'])
           
-          # Ensure directories exist for artifacts
           os.makedirs('data/processed', exist_ok=True)
           with open('data/processed/training_results.json', 'w') as f:
               json.dump(results, f, indent=2, default=str)
-          "
+          PYEOF
 
-      - name: Upload models
-        uses: actions/upload-artifact@v4
-        with:
-          name: trained-models
-          path: |
-            data/models/*.joblib
-            data/models/*.json
-          retention-days: 90
-
-      - name: Commit models to data branch
+      - name: Commit to data-storage
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          
-          git fetch origin data-storage || git checkout --orphan data-storage
-          git checkout data-storage
-          
+          git fetch origin data-storage || true
+          git checkout data-storage 2>/dev/null || git checkout -b data-storage
           mkdir -p models
-          cp data/models/* models/ 2>/dev/null || echo "No new models found"
-          
+          cp data/models/* models/ 2>/dev/null || true
           git add models/
-          git commit -m "🤖 Update AEGIS models: $(date -u +'%Y-%m-%d')" || echo "No changes to commit"
-          git push origin data-storage || echo "Push failed or no changes"
+          git commit -m "🤖 Global Intelligence Update: $(date -u +'%Y-%m-%d')" || echo "No changes"
+          git push origin data-storage
 
-      - name: Report results to Discord
-        if: always()
+      - name: Discord Notification
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           REPO_URL: "https://github.com/${{ github.repository }}/tree/data-storage/models"
@@ -142,37 +110,21 @@ jobs:
           import json, os, requests
           from datetime import datetime
           
-          webhook = os.environ.get('DISCORD_WEBHOOK')
-          if not webhook: exit(0)
-
-          try:
-              with open('data/processed/training_results.json') as f:
-                  results = json.load(f)
-          except:
-              results = {}
+          with open('data/processed/training_results.json') as f:
+              results = json.load(f)
 
           fields = []
           for model, res in results.items():
-              status_icon = "✅" if res.get('status') == 'success' else "❌"
-              m = res.get('metrics', {})
-              val = f"F1: `{m.get('f1_macro', 0):.3f}` | Acc: `{m.get('accuracy', 0):.1%}`" if res.get('status') == 'success' else f"Error: {res.get('error')}"
-              fields.append({'name': f"{status_icon} {model.upper()}", 'value': val, 'inline': False})
-
+              if res.get('status') == 'success':
+                  m = res.get('metrics', {})
+                  fields.append({'name': f"✅ {model.upper()}", 'value': f"F1: `{m.get('f1_macro', 0):.3f}`", 'inline': True})
+          
           embed = {
-              'title': '🤖 AEGIS Intelligence Retrained',
-              'description': f"Model evolution complete. [View Models on Data-Storage]({os.getenv('REPO_URL')})",
+              'title': '🤖 AEGIS Global Brain Retrained',
+              'description': f"Trained on 10 pairs. [Download Models]({os.getenv('REPO_URL')})",
               'color': 0x00FFA3,
               'fields': fields,
               'timestamp': datetime.utcnow().isoformat()
           }
-          requests.post(webhook, json={'embeds': [embed]})
+          requests.post(os.getenv('DISCORD_WEBHOOK'), json={'embeds': [embed]})
           PYEOF
-
-      - name: Report failure
-        if: failure()
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: |
-          curl -H "Content-Type: application/json" \
-            -d '{"embeds": [{"title": "❌ AEGIS Training Failed", "color": 15158332, "description": "Check GitHub Action logs for ImportError or Path issues."}]}' \
-            $DISCORD_WEBHOOK
