@@ -40,11 +40,9 @@ jobs:
           import os, yaml, sys
           from src.core.data_fetcher import DataFetcher, ExchangeManager
           
-          # Initialize Core Data Engine
           manager = ExchangeManager()
           fetcher = DataFetcher(manager, data_dir="data")
           
-          # Load Assets
           try:
               with open('config/assets.yaml', 'r') as f:
                   assets_cfg = yaml.safe_load(f)
@@ -52,7 +50,6 @@ jobs:
               print(f"❌ Critical: Could not read config/assets.yaml: {e}")
               sys.exit(1)
           
-          # Navigate your specific structure: categories -> {group} -> pairs -> {symbols}
           categories = assets_cfg.get('categories', {})
           target_groups = ['majors', 'large_cap', 'mid_cap']
           found_count = 0
@@ -62,20 +59,19 @@ jobs:
               pairs_dict = group_data.get('pairs', {})
               
               if not pairs_dict:
-                  print(f"⚠️ No pairs found for category: {group}")
                   continue
 
               for symbol_key in pairs_dict.keys():
                   print(f"📥 Deep Fetching {symbol_key} (5000 bars)...")
                   try:
-                      # We use the key (e.g., BTCUSDT) for the fetcher
+                      # Limit to 5000 to ensure enough history for feature engineering
                       fetcher.fetch_ohlcv(symbol_key, timeframe='1h', limit=5000)
                       found_count += 1
                   except Exception as e:
                       print(f"⚠️ Failed to fetch {symbol_key}: {e}")
           
           if found_count == 0:
-              print("❌ Error: No valid assets found. Logic mismatch with config/assets.yaml")
+              print("❌ Error: No valid assets found.")
               sys.exit(1)
           print(f"✅ Successfully prepared data for {found_count} assets.")
           PYEOF
@@ -92,25 +88,48 @@ jobs:
           raw_dir = Path("data/raw")
           all_dfs = []
           
-          # Load and label all fetched parquet files
+          # 1. Load and Standardize Assets
           for file in raw_dir.glob("*.parquet"):
               try:
                   df = pd.read_parquet(file)
-                  if len(df) > 0:
-                      # Extract symbol from filename (e.g., BTCUSDT_1h.parquet -> BTCUSDT)
+                  if not df.empty:
+                      # Ensure index is datetime
+                      df.index = pd.to_datetime(df.index)
+                      # Track symbol within the dataframe
                       df['symbol'] = file.stem.split('_')[0]
                       all_dfs.append(df)
               except Exception as e:
-                  print(f"Could not load {file}: {e}")
+                  print(f"⚠️ Could not load {file}: {e}")
           
           if not all_dfs:
               print("❌ No training data found in data/raw."); sys.exit(1)
               
+          # 2. Align Data (Global Concatenation)
+          # We use ignore_index=False to preserve the datetime index, 
+          # but we sort by [index, symbol] to keep asset blocks together.
           combined = pd.concat(all_dfs).sort_index()
+          
+          # 3. Pre-cleaning to prevent X/y mismatch
+          # Dropping rows with NaNs (which often occur in the first few rows of indicators)
+          # ensures that target and features maintain a 1:1 ratio.
+          initial_len = len(combined)
+          combined = combined.dropna()
+          print(f"🧹 Cleaned data: {initial_len} -> {len(combined)} samples.")
+
           print(f"🚀 Training Global Brain on {len(combined)} total samples.")
 
-          trainer = TrainingPipeline()
-          results = trainer.run_full_training(combined, model_types=['lightgbm', 'xgboost', 'ensemble'])
+          # 4. Run Pipeline
+          try:
+              trainer = TrainingPipeline()
+              results = trainer.run_full_training(
+                  combined, 
+                  model_types=['lightgbm', 'xgboost', 'ensemble']
+              )
+          except Exception as e:
+              print(f"❌ Training Pipeline failed: {e}")
+              import traceback
+              traceback.print_exc()
+              sys.exit(1)
           
           os.makedirs('data/processed', exist_ok=True)
           with open('data/processed/training_results.json', 'w') as f:
@@ -126,10 +145,11 @@ jobs:
           git checkout data-storage 2>/dev/null || git checkout --orphan data-storage
           
           mkdir -p models
-          cp data/models/* models/ 2>/dev/null || true
+          # Copy all generated models from the training step
+          cp data/models/*.joblib models/ 2>/dev/null || true
           
           git add models/
-          git commit -m "🤖 Global Intelligence Update: $(date -u +'%Y-%m-%d %H:%M')" || echo "No changes"
+          git commit -m "🤖 Global Intelligence Update: $(date -u +'%Y-%m-%d %H:%M')" || echo "No changes to commit"
           git push origin data-storage
 
       - name: Discord Notification
@@ -155,7 +175,7 @@ jobs:
                   stats = f"🎯 F1: `{m.get('f1_macro', 0):.3f}` | Acc: `{m.get('accuracy', 0):.1%}`"
                   fields.append({'name': f"✅ {model.upper()}", 'value': stats, 'inline': False})
               else:
-                  err = res.get('error', 'Unknown Error') if isinstance(res, dict) else "Failed"
+                  err = res.get('error', 'Check Logs') if isinstance(res, dict) else "Unknown"
                   fields.append({'name': f"❌ {model.upper()}", 'value': f"Failed: {err}", 'inline': False})
           
           embed = {
@@ -174,5 +194,5 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           curl -H "Content-Type: application/json" \
-            -d '{"embeds": [{"title": "❌ AEGIS Training Failed", "color": 15158332, "description": "Check logs for YAML parsing or Data Fetcher errors."}]}' \
+            -d '{"embeds": [{"title": "❌ AEGIS Training Failed", "color": 15158332, "description": "Mismatch in sample sizes (X vs y) or data fetcher error. Check GitHub Action logs."}]}' \
             $DISCORD_WEBHOOK
