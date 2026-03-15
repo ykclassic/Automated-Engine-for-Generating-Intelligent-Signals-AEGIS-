@@ -44,7 +44,7 @@ jobs:
           manager = ExchangeManager()
           fetcher = DataFetcher(manager, data_dir="data")
           
-          # Load Assets with "Flexible Root" logic to avoid KeyError
+          # Load Assets
           try:
               with open('config/assets.yaml', 'r') as f:
                   assets_cfg = yaml.safe_load(f)
@@ -52,26 +52,30 @@ jobs:
               print(f"❌ Critical: Could not read config/assets.yaml: {e}")
               sys.exit(1)
           
-          # Check if assets are nested under 'assets' key or at top level
-          data_root = assets_cfg.get('assets', assets_cfg)
-          categories = ['majors', 'large_cap', 'mid_cap']
+          # Navigate your specific structure: categories -> {group} -> pairs -> {symbols}
+          categories = assets_cfg.get('categories', {})
+          target_groups = ['majors', 'large_cap', 'mid_cap']
           found_count = 0
 
-          for cat in categories:
-              pairs = data_root.get(cat, [])
-              for asset in pairs:
-                  symbol = asset.get('symbol')
-                  if symbol:
-                      print(f"📥 Deep Fetching {symbol} (5000 bars)...")
-                      try:
-                          # Using 5000 to provide 7 months of H1 data for ML
-                          fetcher.fetch_ohlcv(symbol, timeframe='1h', limit=5000)
-                          found_count += 1
-                      except Exception as e:
-                          print(f"⚠️ Failed to fetch {symbol}: {e}")
+          for group in target_groups:
+              group_data = categories.get(group, {})
+              pairs_dict = group_data.get('pairs', {})
+              
+              if not pairs_dict:
+                  print(f"⚠️ No pairs found for category: {group}")
+                  continue
+
+              for symbol_key in pairs_dict.keys():
+                  print(f"📥 Deep Fetching {symbol_key} (5000 bars)...")
+                  try:
+                      # We use the key (e.g., BTCUSDT) for the fetcher
+                      fetcher.fetch_ohlcv(symbol_key, timeframe='1h', limit=5000)
+                      found_count += 1
+                  except Exception as e:
+                      print(f"⚠️ Failed to fetch {symbol_key}: {e}")
           
           if found_count == 0:
-              print("❌ Error: No valid assets found. Check YAML structure.")
+              print("❌ Error: No valid assets found. Logic mismatch with config/assets.yaml")
               sys.exit(1)
           print(f"✅ Successfully prepared data for {found_count} assets.")
           PYEOF
@@ -93,6 +97,7 @@ jobs:
               try:
                   df = pd.read_parquet(file)
                   if len(df) > 0:
+                      # Extract symbol from filename (e.g., BTCUSDT_1h.parquet -> BTCUSDT)
                       df['symbol'] = file.stem.split('_')[0]
                       all_dfs.append(df)
               except Exception as e:
@@ -105,7 +110,6 @@ jobs:
           print(f"🚀 Training Global Brain on {len(combined)} total samples.")
 
           trainer = TrainingPipeline()
-          # This saves .joblib files to data/models/
           results = trainer.run_full_training(combined, model_types=['lightgbm', 'xgboost', 'ensemble'])
           
           os.makedirs('data/processed', exist_ok=True)
@@ -118,12 +122,10 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           
-          # Fetch and switch to the data-storage branch
           git fetch origin data-storage || true
           git checkout data-storage 2>/dev/null || git checkout --orphan data-storage
           
           mkdir -p models
-          # Copy models and metadata from the runner's workspace
           cp data/models/* models/ 2>/dev/null || true
           
           git add models/
@@ -148,16 +150,17 @@ jobs:
 
           fields = []
           for model, res in results.items():
-              if res.get('status') == 'success':
+              if isinstance(res, dict) and res.get('status') == 'success':
                   m = res.get('metrics', {})
                   stats = f"🎯 F1: `{m.get('f1_macro', 0):.3f}` | Acc: `{m.get('accuracy', 0):.1%}`"
                   fields.append({'name': f"✅ {model.upper()}", 'value': stats, 'inline': False})
               else:
-                  fields.append({'name': f"❌ {model.upper()}", 'value': f"Failed: {res.get('error', 'Error')}", 'inline': False})
+                  err = res.get('error', 'Unknown Error') if isinstance(res, dict) else "Failed"
+                  fields.append({'name': f"❌ {model.upper()}", 'value': f"Failed: {err}", 'inline': False})
           
           embed = {
               'title': '🤖 AEGIS Model Retraining Complete',
-              'description': f"Global training on 10 pairs finished.\n[📂 **Download Latest Models**]({os.getenv('REPO_URL')})",
+              'description': f"Global training finished.\n[📂 **Download Latest Models**]({os.getenv('REPO_URL')})",
               'color': 0x00FFA3,
               'fields': fields,
               'timestamp': datetime.utcnow().isoformat()
@@ -171,5 +174,5 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           curl -H "Content-Type: application/json" \
-            -d '{"embeds": [{"title": "❌ AEGIS Training Failed", "color": 15158332, "description": "Check logs for KeyError or Data Drought errors."}]}' \
+            -d '{"embeds": [{"title": "❌ AEGIS Training Failed", "color": 15158332, "description": "Check logs for YAML parsing or Data Fetcher errors."}]}' \
             $DISCORD_WEBHOOK
