@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 class TrainingPipeline:
     """
-    End-to-end training pipeline
+    End-to-end training pipeline with dynamic label correction
     """
     
     def __init__(self, config_path: str = "config/settings.yaml"):
@@ -68,7 +68,7 @@ class TrainingPipeline:
             raise ValueError(f"Insufficient samples: {len(df_clean)}")
 
         # 2. Dynamic Zero-Indexed Label Mapping
-        # This guarantees labels are always [0, 1, 2...] regardless of input
+        # This guarantees labels are always [0, 1, 2...] regardless of the raw input format
         unique_classes = sorted(df_clean['target'].unique())
         dynamic_map = {val: idx for idx, val in enumerate(unique_classes)}
         logger.info(f"Applying dynamic label map: {dynamic_map}")
@@ -93,7 +93,7 @@ class TrainingPipeline:
         optimize: bool = False
     ) -> Tuple[object, Dict]:
         """
-        Train a single model with validation
+        Train a single model with class-diversity validation safety
         """
         logger.info(f"Training {model_type}...")
         
@@ -108,32 +108,32 @@ class TrainingPipeline:
         validator = WalkForwardValidator(min_train_size=1000, test_size=200, step_size=100)
         fold_metrics = []
         
+        # Total classes required
+        total_classes = len(np.unique(df['target']))
+
         for fold, (train_df, test_df) in enumerate(validator.split(df)):
             X_tr, y_tr = train_df[feature_cols], train_df['target']
             X_te, y_te = test_df[feature_cols], test_df['target']
             
-            # Skip fold if it lacks class diversity (prevents XGBoost crashes on small slices)
-            if len(np.unique(y_tr)) < len(np.unique(df['target'])):
-                logger.warning(f"Skipping fold {fold}: Missing target classes in training slice.")
+            # XGBoost check: Skip fold if a class is missing in the training slice
+            if len(np.unique(y_tr)) < total_classes:
+                logger.warning(f"Skipping fold {fold}: Missing classes in training slice.")
                 continue
 
-            # FIT
             model.fit(X_tr, y_tr)
-            
             preds = model.predict(X_te)
             probs = model.predict_proba(X_te)
             
-            metrics = ValidationMetrics.calculate_metrics(y_te.values, preds, probs)
-            fold_metrics.append(metrics)
+            fold_metrics.append(ValidationMetrics.calculate_metrics(y_te.values, preds, probs))
         
         if not fold_metrics:
-            raise ValueError("All validation folds failed due to class imbalance. Increase step_size/test_size.")
+            raise ValueError("All validation folds failed class diversity check. Increase data or window size.")
 
         avg_metrics = {k: np.mean([m[k] for m in fold_metrics]) 
                       for k in fold_metrics[0].keys() 
                       if isinstance(fold_metrics[0][k], (int, float))}
         
-        # Final training on full set
+        # Final training on full history
         model.fit(df[feature_cols], df['target'])
         
         self.training_log.append({
@@ -150,7 +150,7 @@ class TrainingPipeline:
         feature_cols: List[str]
     ) -> Tuple[EnsembleModel, Dict]:
         """
-        Train ensemble of multiple models
+        Train ensemble of multiple models with robust fallback
         """
         logger.info("Training ensemble...")
         ensemble = EnsembleModel()
@@ -162,20 +162,19 @@ class TrainingPipeline:
             except Exception as e:
                 logger.error(f"Ensemble failed to include {m_type}: {e}")
         
-        # Fallback if no models were added
         if not ensemble.models:
-            raise RuntimeError("Ensemble has no valid models to fit.")
+            raise RuntimeError("Ensemble has no valid models.")
 
         ensemble.fit(df[feature_cols], df['target'])
         
         # Cross-validation for the ensemble
         validator = WalkForwardValidator(min_train_size=1000, test_size=200, step_size=100)
         e_metrics = []
-        for train_df, test_df in validator.split(df):
-            # Same class diversity check for ensemble folds
-            if len(np.unique(train_df['target'])) < len(np.unique(df['target'])):
-                continue
-
+        total_classes = len(np.unique(df['target']))
+        
+        for _, test_df in validator.split(df):
+            if len(np.unique(test_df['target'])) < 2: continue
+            
             probs = ensemble.predict_proba(test_df[feature_cols])
             preds = ensemble.predict(test_df[feature_cols])
             e_metrics.append(ValidationMetrics.calculate_metrics(test_df['target'].values, preds, probs))
@@ -188,7 +187,7 @@ class TrainingPipeline:
 
     def save_model(self, model: object, model_name: str, feature_cols: List[str], metrics: Dict):
         """
-        Persist model and metadata
+        Save model and metadata with JSON serialization safety
         """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_path = self.models_dir / f"{model_name}_{timestamp}.joblib"
@@ -209,7 +208,6 @@ class TrainingPipeline:
         with open(meta_path, 'w') as f:
             json.dump(metadata, f, indent=2)
             
-        # Pointers for 'latest'
         joblib.dump(model, self.models_dir / f"{model_name}_latest.joblib")
         with open(self.models_dir / f"{model_name}_latest_meta.json", 'w') as f:
             json.dump(metadata, f, indent=2)
@@ -219,9 +217,6 @@ class TrainingPipeline:
         df: pd.DataFrame,
         model_types: List[str] = ['lightgbm', 'xgboost', 'ensemble']
     ) -> Dict[str, Dict]:
-        """
-        Master loop for full pipeline execution
-        """
         results = {}
         df_clean, feature_cols = self.prepare_data(df)
         
@@ -240,7 +235,6 @@ class TrainingPipeline:
                 
         return results
 
-# Convenience function
 def train_model(df: pd.DataFrame, model_type: str = 'ensemble') -> Tuple[object, Dict]:
     pipeline = TrainingPipeline()
     results = pipeline.run_full_training(df, [model_type])
