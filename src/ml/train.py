@@ -4,6 +4,7 @@ End-to-end training with validation and calibration
 """
 
 import logging
+import json  # Added missing import
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 from datetime import datetime
@@ -49,31 +50,31 @@ class TrainingPipeline:
         top_n_features: int = 30
     ) -> Tuple[pd.DataFrame, List[str]]:
         """
-        Prepare data for training
+        Prepare data for training with strict alignment and label encoding
         """
         logger.info("Engineering features...")
         df_features = engineer_ml_features(df, include_target=True)
         
-        # Remove rows with missing targets
-        df_clean = df_features.dropna(subset=['target'])
+        # 1. Clean data
+        df_clean = df_features.dropna().copy()
+        
+        # 2. Map Labels: LightGBM/XGBoost require [0, 1, 2] instead of [-1, 0, 1]
+        # Mapping: -1 -> 0 (Down), 0 -> 1 (Neutral), 1 -> 2 (Up)
+        label_map = {-1: 0, 0: 1, 1: 2}
+        df_clean['target'] = df_clean['target'].map(label_map)
         
         if len(df_clean) < 1000:
-            raise ValueError(f"Insufficient data: {len(df_clean)} samples")
+            raise ValueError(f"Insufficient data: {len(df_clean)} samples after dropna")
         
-        # Feature selection
+        # 3. Feature selection
         if feature_selection:
             logger.info(f"Selecting top {top_n_features} features...")
             selected_features = self.feature_engineer.get_feature_importance_mask(
                 df_clean, top_n=top_n_features
             )
         else:
-            selected_features = [
-                c for c in df_clean.columns 
-                if c not in ['target', 'target_return']
-            ]
-        
-        logger.info(f"Final dataset: {len(df_clean)} samples, {len(selected_features)} features")
-        
+            selected_features = [c for c in df_clean.columns if c not in ['target', 'target_return']]
+            
         return df_clean, selected_features
     
     def train_single_model(
@@ -88,72 +89,35 @@ class TrainingPipeline:
         """
         logger.info(f"Training {model_type} model...")
         
-        # Optimize hyperparameters if requested
         if optimize:
             optimizer = ModelOptimizer(model_type)
             best_params = optimizer.optimize(df[feature_cols], df['target'])
-            
-            config = ModelConfig(
-                name=model_type,
-                model_type='classification',
-                params=best_params
-            )
-            
-            if model_type == 'lightgbm':
-                model = LightGBMModel(config)
-            else:
-                model = XGBoostModel(config)
+            config = ModelConfig(name=model_type, model_type='classification', params=best_params)
+            model = LightGBMModel(config) if model_type == 'lightgbm' else XGBoostModel(config)
         else:
-            if model_type == 'lightgbm':
-                model = LightGBMModel()
-            else:
-                model = XGBoostModel()
+            model = LightGBMModel() if model_type == 'lightgbm' else XGBoostModel()
         
-        # Walk-forward validation
-        logger.info("Running walk-forward validation...")
-        validator = WalkForwardValidator(
-            min_train_size=1000,
-            test_size=200,
-            step_size=100
-        )
-        
+        validator = WalkForwardValidator(min_train_size=1000, test_size=200, step_size=100)
         fold_metrics = []
-        for fold, (train_df, test_df) in enumerate(validator.split(df)):
-            logger.info(f"Fold {fold + 1}/{validator.get_n_splits(df)}")
-            
-            # Train
+        
+        for train_df, test_df in validator.split(df):
             model.fit(train_df[feature_cols], train_df['target'])
-            
-            # Predict
             predictions = model.predict(test_df[feature_cols])
             probabilities = model.predict_proba(test_df[feature_cols])
             
-            # Metrics
-            metrics = ValidationMetrics.calculate_metrics(
-                test_df['target'].values,
-                predictions,
-                probabilities
-            )
+            metrics = ValidationMetrics.calculate_metrics(test_df['target'].values, predictions, probabilities)
             fold_metrics.append(metrics)
         
-        # Average metrics
-        avg_metrics = {}
-        for key in fold_metrics[0].keys():
-            if isinstance(fold_metrics[0][key], (int, float)):
-                avg_metrics[key] = np.mean([m[key] for m in fold_metrics])
+        avg_metrics = {k: np.mean([m[k] for m in fold_metrics]) 
+                      for k in fold_metrics[0].keys() 
+                      if isinstance(fold_metrics[0][k], (int, float))}
         
-        # Final training on full dataset
-        logger.info("Training final model on full dataset...")
         model.fit(df[feature_cols], df['target'])
         
-        # Log training
         self.training_log.append({
             'timestamp': datetime.now().isoformat(),
             'model_type': model_type,
-            'n_samples': len(df),
-            'n_features': len(feature_cols),
-            'metrics': avg_metrics,
-            'feature_importance': model.feature_importance
+            'metrics': avg_metrics
         })
         
         return model, avg_metrics
@@ -167,60 +131,33 @@ class TrainingPipeline:
         Train ensemble of multiple models
         """
         logger.info("Training ensemble...")
-        
         ensemble = EnsembleModel()
         
-        # Train LightGBM
-        try:
-            lgb_model, lgb_metrics = self.train_single_model(
-                df, feature_cols, 'lightgbm', optimize=False
-            )
-            ensemble.add_model(lgb_model, weight=0.5)
-            logger.info(f"LightGBM F1: {lgb_metrics['f1_macro']:.4f}")
-        except Exception as e:
-            logger.warning(f"LightGBM training failed: {e}")
+        # Add components
+        for m_type in ['lightgbm', 'xgboost']:
+            try:
+                m_obj, m_met = self.train_single_model(df, feature_cols, m_type)
+                ensemble.add_model(m_obj, weight=0.5)
+            except Exception as e:
+                logger.error(f"Failed to add {m_type} to ensemble: {e}")
         
-        # Train XGBoost
-        try:
-            xgb_model, xgb_metrics = self.train_single_model(
-                df, feature_cols, 'xgboost', optimize=False
-            )
-            ensemble.add_model(xgb_model, weight=0.5)
-            logger.info(f"XGBoost F1: {xgb_metrics['f1_macro']:.4f}")
-        except Exception as e:
-            logger.warning(f"XGBoost training failed: {e}")
-        
-        # Fit ensemble (just sets weights)
         ensemble.fit(df[feature_cols], df['target'])
         
         # Validate ensemble
         validator = WalkForwardValidator(min_train_size=1000, test_size=200, step_size=100)
         fold_metrics = []
-        
         for train_df, test_df in validator.split(df):
-            predictions = ensemble.predict(test_df[feature_cols])
-            probabilities = ensemble.predict_proba(test_df[feature_cols])
+            probs = ensemble.predict_proba(test_df[feature_cols])
+            preds = ensemble.predict(test_df[feature_cols])
+            fold_metrics.append(ValidationMetrics.calculate_metrics(test_df['target'].values, preds, probs))
             
-            metrics = ValidationMetrics.calculate_metrics(
-                test_df['target'].values,
-                predictions,
-                probabilities
-            )
-            fold_metrics.append(metrics)
-        
         avg_metrics = {k: np.mean([m[k] for m in fold_metrics]) 
                       for k in fold_metrics[0].keys() 
                       if isinstance(fold_metrics[0][k], (int, float))}
         
         return ensemble, avg_metrics
     
-    def save_model(
-        self,
-        model: object,
-        model_name: str,
-        feature_cols: List[str],
-        metrics: Dict
-    ):
+    def save_model(self, model: object, model_name: str, feature_cols: List[str], metrics: Dict):
         """
         Save model and metadata
         """
@@ -228,86 +165,49 @@ class TrainingPipeline:
         model_path = self.models_dir / f"{model_name}_{timestamp}.joblib"
         meta_path = self.models_dir / f"{model_name}_{timestamp}_meta.json"
         
-        # Save model
         joblib.dump(model, model_path)
         
-        # Save metadata
+        # Numpy to Python type conversion for JSON
+        clean_metrics = {k: float(v) if isinstance(v, (np.floating, float)) else v 
+                        for k, v in metrics.items()}
+        
         metadata = {
             'model_name': model_name,
             'timestamp': timestamp,
             'features': feature_cols,
-            'metrics': {k: float(v) if isinstance(v, (np.floating, float)) else v 
-                       for k, v in metrics.items()},
-            'training_log': self.training_log
+            'metrics': clean_metrics
         }
         
         with open(meta_path, 'w') as f:
             json.dump(metadata, f, indent=2)
-        
-        logger.info(f"Model saved: {model_path}")
-        
-        # Also save as 'latest'
-        latest_path = self.models_dir / f"{model_name}_latest.joblib"
-        latest_meta_path = self.models_dir / f"{model_name}_latest_meta.json"
-        joblib.dump(model, latest_path)
-        
-        with open(latest_meta_path, 'w') as f:
+            
+        # Pointers for 'latest'
+        joblib.dump(model, self.models_dir / f"{model_name}_latest.joblib")
+        with open(self.models_dir / f"{model_name}_latest_meta.json", 'w') as f:
             json.dump(metadata, f, indent=2)
-    
+
     def run_full_training(
         self,
         df: pd.DataFrame,
         model_types: List[str] = ['lightgbm', 'xgboost', 'ensemble']
     ) -> Dict[str, Dict]:
         """
-        Run complete training pipeline for multiple models
+        Main execution loop
         """
         results = {}
-        
-        # Prepare data
         df_clean, feature_cols = self.prepare_data(df)
         
-        # Train each model type
-        for model_type in model_types:
+        for m_type in model_types:
             try:
-                if model_type == 'ensemble':
+                if m_type == 'ensemble':
                     model, metrics = self.train_ensemble(df_clean, feature_cols)
                 else:
-                    model, metrics = self.train_single_model(
-                        df_clean, feature_cols, model_type, optimize=False
-                    )
+                    model, metrics = self.train_single_model(df_clean, feature_cols, m_type)
                 
-                # Save model
-                self.save_model(model, model_type, feature_cols, metrics)
-                
-                results[model_type] = {
-                    'status': 'success',
-                    'metrics': metrics,
-                    'n_features': len(feature_cols)
-                }
-                
-                logger.info(f"{model_type} training complete. F1: {metrics['f1_macro']:.4f}")
-                
+                self.save_model(model, m_type, feature_cols, metrics)
+                results[m_type] = {'status': 'success', 'metrics': metrics}
             except Exception as e:
-                logger.error(f"{model_type} training failed: {e}")
-                results[model_type] = {
-                    'status': 'failed',
-                    'error': str(e)
-                }
-        
+                logger.error(f"{m_type} failed: {e}")
+                results[m_type] = {'status': 'failed', 'error': str(e)}
+                
         return results
-
-
-# Convenience function
-def train_model(df: pd.DataFrame, model_type: str = 'ensemble') -> Tuple[object, Dict]:
-    """Quick model training"""
-    pipeline = TrainingPipeline()
-    df_clean, feature_cols = pipeline.prepare_data(df)
-    
-    if model_type == 'ensemble':
-        model, metrics = pipeline.train_ensemble(df_clean, feature_cols)
-    else:
-        model, metrics = pipeline.train_single_model(df_clean, feature_cols, model_type)
-    
-    pipeline.save_model(model, model_type, feature_cols, metrics)
-    return model, metrics
