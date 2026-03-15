@@ -15,7 +15,7 @@ import numpy as np
 import yaml
 import joblib
 
-# Suppress technical noise
+# Suppress technical noise from LightGBM
 warnings.filterwarnings('ignore', category=UserWarning, module='lightgbm')
 
 from .features import MLFeatureEngineer, engineer_ml_features
@@ -56,7 +56,7 @@ class TrainingPipeline:
         top_n_features: int = 30
     ) -> Tuple[pd.DataFrame, List[str]]:
         """
-        Prepare data with strict alignment and fixed label mapping
+        Prepare data with strict alignment and dynamic label encoding
         """
         logger.info("Engineering features and aligning indices...")
         df_features = engineer_ml_features(df, include_target=True)
@@ -64,13 +64,16 @@ class TrainingPipeline:
         # 1. Strict Clean
         df_clean = df_features.dropna().copy()
         
-        # 2. Hardcoded Label Mapping: ensures consistency across folds
-        # -1 -> 0 (Down), 0 -> 1 (Neutral), 1 -> 2 (Up)
-        label_map = {-1: 0, 0: 1, 1: 2}
-        df_clean['target'] = df_clean['target'].astype(int).map(label_map)
-        
         if len(df_clean) < 1000:
             raise ValueError(f"Insufficient samples: {len(df_clean)}")
+
+        # 2. Dynamic Zero-Indexed Label Mapping
+        # This guarantees labels are always [0, 1, 2...] regardless of input
+        unique_classes = sorted(df_clean['target'].unique())
+        dynamic_map = {val: idx for idx, val in enumerate(unique_classes)}
+        logger.info(f"Applying dynamic label map: {dynamic_map}")
+        
+        df_clean['target'] = df_clean['target'].map(dynamic_map).astype(int)
         
         # 3. Feature Selection
         if feature_selection:
@@ -109,6 +112,11 @@ class TrainingPipeline:
             X_tr, y_tr = train_df[feature_cols], train_df['target']
             X_te, y_te = test_df[feature_cols], test_df['target']
             
+            # Skip fold if it lacks class diversity (prevents XGBoost crashes on small slices)
+            if len(np.unique(y_tr)) < len(np.unique(df['target'])):
+                logger.warning(f"Skipping fold {fold}: Missing target classes in training slice.")
+                continue
+
             # FIT
             model.fit(X_tr, y_tr)
             
@@ -118,6 +126,9 @@ class TrainingPipeline:
             metrics = ValidationMetrics.calculate_metrics(y_te.values, preds, probs)
             fold_metrics.append(metrics)
         
+        if not fold_metrics:
+            raise ValueError("All validation folds failed due to class imbalance. Increase step_size/test_size.")
+
         avg_metrics = {k: np.mean([m[k] for m in fold_metrics]) 
                       for k in fold_metrics[0].keys() 
                       if isinstance(fold_metrics[0][k], (int, float))}
@@ -151,12 +162,20 @@ class TrainingPipeline:
             except Exception as e:
                 logger.error(f"Ensemble failed to include {m_type}: {e}")
         
+        # Fallback if no models were added
+        if not ensemble.models:
+            raise RuntimeError("Ensemble has no valid models to fit.")
+
         ensemble.fit(df[feature_cols], df['target'])
         
         # Cross-validation for the ensemble
         validator = WalkForwardValidator(min_train_size=1000, test_size=200, step_size=100)
         e_metrics = []
-        for _, test_df in validator.split(df):
+        for train_df, test_df in validator.split(df):
+            # Same class diversity check for ensemble folds
+            if len(np.unique(train_df['target'])) < len(np.unique(df['target'])):
+                continue
+
             probs = ensemble.predict_proba(test_df[feature_cols])
             preds = ensemble.predict(test_df[feature_cols])
             e_metrics.append(ValidationMetrics.calculate_metrics(test_df['target'].values, preds, probs))
