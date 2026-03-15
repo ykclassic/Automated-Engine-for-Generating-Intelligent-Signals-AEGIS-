@@ -465,13 +465,27 @@ class MLFeatureEngineer:
     ) -> List[str]:
         """
         Get mask of most important features based on mutual information
+        Ensures strict synchronization between X and y to prevent length mismatch.
         """
         from sklearn.feature_selection import mutual_info_classif
         
-        feature_cols = [c for c in df.columns if c not in ['target', 'target_return']]
-        X = df[feature_cols].dropna()
-        y = df.loc[X.index, 'target']
+        # Filter for rows that have both features and target
+        clean_df = df.dropna(subset=['target'])
+        feature_cols = [c for c in clean_df.columns if c not in ['target', 'target_return']]
         
+        # Ensure X and y are perfectly aligned on the same index
+        X = clean_df[feature_cols]
+        y = clean_df['target']
+        
+        # Double-check alignment logic
+        common_idx = X.index.intersection(y.index)
+        X = X.loc[common_idx]
+        y = y.loc[common_idx]
+        
+        if len(X) == 0:
+            logger.warning("Empty dataset passed to feature importance mask.")
+            return []
+
         # Calculate mutual information
         mi = mutual_info_classif(X, y, random_state=42)
         
